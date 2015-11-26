@@ -14,6 +14,7 @@ use dupl_server_proto::{
     Req, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign,
     Rep, LookupResult, Match,
 };
+use dupl_server_proto::bin::{ToBin, FromBin};
 
 const INTERNAL_SOCKET_ADDR: &'static str = "inproc://internal";
 
@@ -22,6 +23,11 @@ pub enum ZmqError {
     Socket(zmq::Error),
     Connect(String, zmq::Error),
     Bind(String, zmq::Error),
+    Send(zmq::Error),
+    Recv(zmq::Error),
+    Poll(zmq::Error),
+    GetSockOpt(zmq::Error),
+    Message(zmq::Error),
 }
 
 #[derive(Debug)]
@@ -122,12 +128,96 @@ pub struct Message<R> {
     pub load: R,
 }
 
-fn master_loop(ext_sock: zmq::Socket,
-               int_sock_master: zmq::Socket,
+fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Req<String>), Error> {
+    let mut frames = Vec::new();
+    loop {
+        frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
+        if !try!(sock.get_rcvmore().map_err(|e| Error::Zmq(ZmqError::GetSockOpt(e)))) {
+            break
+        }
+    }
+
+    let load_msg = frames.pop().unwrap();
+    Ok((Some(frames), try!(Req::decode(&load_msg).map_err(|e| Error::Proto(e))).0))
+}
+
+fn tx_sock(packet: Rep<String>, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
+    let required = packet.encode_len();
+    let mut load_msg = try!(zmq::Message::with_capacity(required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
+    packet.encode(&mut load_msg);
+
+    if let Some(headers) = maybe_headers {
+        for header in headers {
+            try!(sock.send_msg(header, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+        }
+    }
+    sock.send_msg(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
+}
+
+fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
+    sock.send_msg(try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 0)
+        .map_err(|e| Error::Zmq(ZmqError::Send(e)))
+}
+
+fn master_loop(mut ext_sock: zmq::Socket,
+               mut int_sock: zmq::Socket,
                tx: Sender<Message<Req<String>>>,
                rx: Receiver<Message<Rep<String>>>) -> Result<(), Error>
 {
-    Ok(())
+    enum SlaveState { Online, Busy, Finished, }
+    let mut slave_state = SlaveState::Online;
+    loop {
+        let (ext_sock_online, int_sock_online) = {
+            let mut pollitems = [ext_sock.as_poll_item(zmq::POLLIN), int_sock.as_poll_item(zmq::POLLIN)];
+            try!(zmq::poll(&mut pollitems, -1).map_err(|e| Error::Zmq(ZmqError::Poll(e))));
+            (pollitems[0].get_revents() == zmq::POLLIN, pollitems[1].get_revents() == zmq::POLLIN)
+        };
+
+        if int_sock_online {
+            let _ = try!(int_sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
+        }
+
+        loop {
+            if let SlaveState::Finished = slave_state {
+                break
+            }
+
+            match rx.try_recv() {
+                Ok(message) => {
+                    slave_state = SlaveState::Online;
+                    match message.load {
+                        rep @ Rep::TerminateAck => {
+                            slave_state = SlaveState::Finished;
+                            try!(tx_sock(rep, message.headers, &mut ext_sock));
+                        },
+                        rep =>
+                            try!(tx_sock(rep, message.headers, &mut ext_sock)),
+                    }
+                },
+                Err(TryRecvError::Empty) =>
+                    break,
+                Err(TryRecvError::Disconnected) =>
+                    panic!("slave worker thread is down"),
+            }
+        }
+
+        if let SlaveState::Finished = slave_state {
+            return Ok(())
+        }
+
+        if ext_sock_online {
+            match (try!(rx_sock(&mut ext_sock)), &slave_state) {
+                ((headers, req), &SlaveState::Online) => {
+                    tx.send(Message { headers: headers, load: req, }).unwrap();
+                    slave_state = SlaveState::Busy;
+                },
+                ((headers, _), &SlaveState::Busy) =>
+                    try!(tx_sock(Rep::TooBusy, headers, &mut ext_sock)),
+                (_, &SlaveState::Finished) =>
+                    unreachable!(),
+            }
+        }
+    }
 }
 
 fn slave_loop(int_sock_slave: zmq::Socket,
