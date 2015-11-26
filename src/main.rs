@@ -1,6 +1,7 @@
-extern crate dupl_server_proto;
-extern crate getopts;
 extern crate zmq;
+extern crate getopts;
+extern crate yauid;
+extern crate dupl_server_proto;
 
 use std::{io, env, process};
 use std::io::Write;

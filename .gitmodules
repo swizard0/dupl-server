@@ -1,3 +1,6 @@
 [submodule "dupl-server-proto"]
 	path = dupl-server-proto
 	url = git://dev.swizard.info/dupl-server-proto
+[submodule "yauid-rs"]
+	path = yauid-rs
+	url = git://dev.swizard.info/yauid-rs

@@ -7,3 +7,4 @@ authors = ["Alexey Voznyuk <me@swizard.info>"]
 getopts = "*"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
 dupl_server_proto = { path = "dupl-server-proto" }
+yauid-rs = { path = "yauid-rs" }
