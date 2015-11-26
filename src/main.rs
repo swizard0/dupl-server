@@ -33,10 +33,11 @@ pub enum ZmqError {
 #[derive(Debug)]
 pub enum Error {
     Getopts(getopts::Fail),
-
     Zmq(ZmqError),
     Proto(proto::bin::Error),
     Yauid(String),
+    MasterIsDown,
+    SlaveIsDown,
 }
 
 pub struct App {
@@ -102,14 +103,14 @@ pub fn shutdown_app(app: App) -> Result<(), Error> {
             match app.master_watchdog_rx.try_recv() {
                 Ok(()) => master_finished = true,
                 Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Disconnected) => panic!("master thread is down"),
+                Err(TryRecvError::Disconnected) => return Err(Error::MasterIsDown),
             }
         }
         if !slave_finished {
             match app.slave_watchdog_rx.try_recv() {
                 Ok(()) => slave_finished = true,
                 Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Disconnected) => panic!("slave thread is down"),
+                Err(TryRecvError::Disconnected) => return Err(Error::SlaveIsDown),
             }
         }
 
@@ -152,11 +153,6 @@ fn tx_sock(packet: Rep<String>, maybe_headers: Option<Headers>, sock: &mut zmq::
         }
     }
     sock.send_msg(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
-}
-
-fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
-    sock.send_msg(try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 0)
-        .map_err(|e| Error::Zmq(ZmqError::Send(e)))
 }
 
 fn master_loop(mut ext_sock: zmq::Socket,
@@ -220,7 +216,17 @@ fn master_loop(mut ext_sock: zmq::Socket,
     }
 }
 
-fn slave_loop(int_sock_slave: zmq::Socket,
+fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
+    sock.send_msg(try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 0)
+        .map_err(|e| Error::Zmq(ZmqError::Send(e)))
+}
+
+fn rep_notify(rep: Rep<String>, headers: Option<Headers>, tx: &Sender<Message<Rep<String>>>, sock: &mut zmq::Socket) -> Result<(), Error> {
+    tx.send(Message { headers: headers, load: rep, }).unwrap();
+    notify_sock(sock)
+}
+
+fn slave_loop(mut int_sock: zmq::Socket,
               tx: Sender<Message<Rep<String>>>,
               rx: Receiver<Message<Req<String>>>,
               key_file: String,
@@ -231,6 +237,28 @@ fn slave_loop(int_sock_slave: zmq::Socket,
     } else {
         Yauid::new(&key_file, 1)
     }.map_err(|e| Error::Yauid(e)));
+
+    loop {
+        match rx.recv().unwrap() {
+            Message { headers: hdrs, load: Req::Init, } =>
+                try!(rep_notify(Rep::InitAck, hdrs, &tx, &mut int_sock)),
+            Message { headers: hdrs, load: Req::Terminate, } => {
+                try!(rep_notify(Rep::TerminateAck, hdrs, &tx, &mut int_sock));
+                break;
+            },
+            Message { headers: hdrs, load: Req::Lookup(Workload::Single(task)), } => {
+                let rep = LookupResult::Error("todo single".to_owned());
+                try!(rep_notify(Rep::Result(Workload::Single(rep)), hdrs, &tx, &mut int_sock));
+            },
+            Message { headers: hdrs, load: Req::Lookup(Workload::Many(tasks)), } => {
+                let reps: Vec<_> = tasks
+                    .into_iter()
+                    .map(|task| LookupResult::Error("todo many".to_owned()))
+                    .collect();
+                try!(rep_notify(Rep::Result(Workload::Many(reps)), hdrs, &tx, &mut int_sock));
+            },
+        }
+    }
 
     Ok(())
 }
@@ -269,13 +297,36 @@ fn main() {
 
 #[cfg(test)]
 mod test {
+    use zmq;
+    use dupl_server_proto::{Req, Rep};
+    use dupl_server_proto::bin::{ToBin, FromBin};
     use super::{entrypoint, shutdown_app};
+
+    fn tx_sock(packet: Req<String>, sock: &mut zmq::Socket) {
+        let required = packet.encode_len();
+        let mut msg = zmq::Message::with_capacity(required).unwrap();
+        packet.encode(&mut msg);
+        sock.send_msg(msg, 0).unwrap();
+    }
+
+    fn rx_sock(sock: &mut zmq::Socket) -> Rep<String> {
+        let msg = sock.recv_msg(0).unwrap();
+        assert!(!sock.get_rcvmore().unwrap());
+        let (rep, _) = Rep::decode(&msg).unwrap();
+        rep
+    }
 
     #[test]
     fn start_stop() {
-        let app = entrypoint("ipc:///tmp/dupl_server_a".to_owned(),
-                             "/tmp/dupl_server_a.key".to_owned(),
-                             None).unwrap();
+        let mut app = entrypoint("ipc:///tmp/dupl_server_a".to_owned(),
+                                 "/tmp/dupl_server_a.key".to_owned(),
+                                 None).unwrap();
+        {
+            let mut sock = app.zmq_ctx.socket(zmq::REQ).unwrap();
+            sock.connect("ipc:///tmp/dupl_server_a").unwrap();
+            tx_sock(Req::Terminate, &mut sock);
+            match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+        }
         shutdown_app(app).unwrap();
     }
 }
