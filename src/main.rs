@@ -7,9 +7,13 @@ extern crate dupl_server_proto;
 use std::{io, env, process};
 use std::io::Write;
 use std::thread::{Builder, sleep, JoinHandle};
+use std::num::{ParseFloatError, ParseIntError};
 use std::sync::mpsc::{channel, sync_channel, Sender, Receiver, TryRecvError};
 use getopts::Options;
 use yauid::Yauid;
+use hash_dupl::{HashDupl, Config, Shingles};
+use hash_dupl::shingler::tokens::Tokens;
+use hash_dupl::backend::in_memory::InMemory;
 use dupl_server_proto as proto;
 use dupl_server_proto::{
     Req, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign,
@@ -34,6 +38,10 @@ pub enum ZmqError {
 #[derive(Debug)]
 pub enum Error {
     Getopts(getopts::Fail),
+    InvalidSignatureLength(ParseIntError),
+    InvalidSimilarityThreshold(ParseFloatError),
+    InvalidShingleLength(ParseIntError),
+    InvalidBandMinProbability(ParseFloatError),
     Zmq(ZmqError),
     Proto(proto::bin::Error),
     Yauid(String),
@@ -54,16 +62,32 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     let external_zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./dupl_server.ipc".to_owned());
     let key_file = matches.opt_str("key-file").unwrap_or("/tmp/hbase.key".to_owned());
     let node_id = matches.opt_str("node-id");
+    let signature_length = try!(matches.opt_str("signature-length").map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None))
+                                .map_err(|e| Error::InvalidSignatureLength(e)));
+    let shingle_length = try!(matches.opt_str("shingle-length").map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None))
+                              .map_err(|e| Error::InvalidShingleLength(e)));
+    let similarity_threshold = try!(matches.opt_str("similarity-threshold").map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None))
+                                    .map_err(|e| Error::InvalidSimilarityThreshold(e)));
+    let band_min_probability = try!(matches.opt_str("band-min-probability").map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None))
+                                    .map_err(|e| Error::InvalidBandMinProbability(e)));
 
     let app = try!(entrypoint(external_zmq_addr,
                               key_file,
-                              node_id));
+                              node_id,
+                              signature_length,
+                              shingle_length,
+                              similarity_threshold,
+                              band_min_probability));
     shutdown_app(app)
 }
 
 pub fn entrypoint(external_zmq_addr: String,
                   key_file: String,
-                  node_id: Option<String>) -> Result<App, Error>
+                  node_id: Option<String>,
+                  signature_length: Option<usize>,
+                  shingle_length: Option<usize>,
+                  similarity_threshold: Option<f64>,
+                  band_min_probability: Option<f64>) -> Result<App, Error>
 {
     let mut zmq_ctx = zmq::Context::new();
     let mut ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -84,7 +108,15 @@ pub fn entrypoint(external_zmq_addr: String,
     }).unwrap();
 
     let slave_thread = Builder::new().name("slave thread".to_owned()).spawn(move || {
-        slave_loop(int_sock_slave, slave_tx, slave_rx, key_file, node_id).unwrap();
+        slave_loop(int_sock_slave,
+                   slave_tx,
+                   slave_rx,
+                   key_file,
+                   node_id,
+                   signature_length,
+                   shingle_length,
+                   similarity_threshold,
+                   band_min_probability).unwrap();
         slave_watchdog_tx.send(()).unwrap();
     }).unwrap();
 
@@ -231,13 +263,26 @@ fn slave_loop(mut int_sock: zmq::Socket,
               tx: Sender<Message<Rep<String>>>,
               rx: Receiver<Message<Req<String>>>,
               key_file: String,
-              node_id: Option<String>) -> Result<(), Error>
+              node_id: Option<String>,
+              signature_length: Option<usize>,
+              shingle_length: Option<usize>,
+              similarity_threshold: Option<f64>,
+              band_min_probability: Option<f64>) -> Result<(), Error>
 {
     let yauid = try!(if let Some(ref node_file) = node_id {
         Yauid::with_node_id(&key_file, node_file)
     } else {
         Yauid::new(&key_file, 1)
     }.map_err(|e| Error::Yauid(e)));
+
+    let mut config = Config::default();
+    signature_length.map(|v| config.signature_length = v);
+    shingle_length.map(|v| config.shingle_length = v);
+    similarity_threshold.map(|v| config.similarity_threshold = v);
+    band_min_probability.map(|v| config.band_min_probability = v);
+
+    let mut hd: HashDupl<_, InMemory<String>> = HashDupl::new(Tokens::new(), InMemory::new(), config).unwrap();
+    let mut shingles = Shingles::new();
 
     loop {
         match rx.recv().unwrap() {
@@ -321,7 +366,7 @@ mod test {
     fn start_stop() {
         let mut app = entrypoint("ipc:///tmp/dupl_server_a".to_owned(),
                                  "/tmp/dupl_server_a.key".to_owned(),
-                                 None).unwrap();
+                                 None, None, None, None, None).unwrap();
         {
             let mut sock = app.zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_a").unwrap();
