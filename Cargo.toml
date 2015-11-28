@@ -8,4 +8,4 @@ getopts = "*"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
 dupl_server_proto = { path = "dupl-server-proto" }
 hash-dupl = { git = "git://dev.swizard.info/hash-dupl" }
-yauid-rs = { path = "yauid-rs" }
+yauid-rs = { git = "git://dev.swizard.info/yauid-rs" }
