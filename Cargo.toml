@@ -1,10 +1,11 @@
 [package]
 name = "dupl-server"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
 getopts = "*"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
 dupl_server_proto = { path = "dupl-server-proto" }
+hash-dupl = { git = "git://dev.swizard.info/hash-dupl" }
 yauid-rs = { path = "yauid-rs" }
