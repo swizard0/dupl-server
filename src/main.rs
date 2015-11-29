@@ -6,12 +6,14 @@ extern crate dupl_server_proto;
 
 use std::{io, env, process};
 use std::io::Write;
+use std::sync::Arc;
+use std::convert::From;
 use std::thread::{Builder, sleep, JoinHandle};
 use std::num::{ParseFloatError, ParseIntError};
 use std::sync::mpsc::{channel, sync_channel, Sender, Receiver, TryRecvError};
 use getopts::Options;
 use yauid::Yauid;
-use hash_dupl::{HashDupl, Config, Shingles};
+use hash_dupl::{HashDupl, Config, Shingles, Backend};
 use hash_dupl::shingler::tokens::Tokens;
 use hash_dupl::backend::in_memory::InMemory;
 use dupl_server_proto as proto;
@@ -42,19 +44,45 @@ pub enum Error {
     InvalidSimilarityThreshold(ParseFloatError),
     InvalidShingleLength(ParseIntError),
     InvalidBandMinProbability(ParseFloatError),
+    InvalidRotateCount(ParseIntError),
     Zmq(ZmqError),
     Proto(proto::bin::Error),
-    Yauid(String),
+    HashDupl(hash_dupl::Error<(), ()>),
+    Yauid(yauid::Error),
     MasterIsDown,
     SlaveIsDown,
 }
 
+impl From<proto::bin::Error> for Error {
+    fn from(err: proto::bin::Error) -> Error {
+        Error::Proto(err)
+    }
+}
+
+impl From<hash_dupl::Error<(), ()>> for Error {
+    fn from(err: hash_dupl::Error<(), ()>) -> Error {
+        Error::HashDupl(err)
+    }
+}
+
+impl From<yauid::Error> for Error {
+    fn from(err: yauid::Error) -> Error {
+        Error::Yauid(err)
+    }
+}
+
 pub struct App {
-    zmq_ctx: zmq::Context,
+    _zmq_ctx: zmq::Context,
     master_thread: JoinHandle<()>,
     master_watchdog_rx: Receiver<()>,
     slave_thread: JoinHandle<()>,
     slave_watchdog_rx: Receiver<()>,
+}
+
+macro_rules! try_param_parse {
+    ($matches:ident, $name:expr, $err:ident) => ({
+        try!($matches.opt_str($name).map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None)).map_err(|e| Error::$err(e)))
+    })
 }
 
 fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
@@ -62,14 +90,11 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     let external_zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./dupl_server.ipc".to_owned());
     let key_file = matches.opt_str("key-file").unwrap_or("/tmp/hbase.key".to_owned());
     let node_id = matches.opt_str("node-id");
-    let signature_length = try!(matches.opt_str("signature-length").map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None))
-                                .map_err(|e| Error::InvalidSignatureLength(e)));
-    let shingle_length = try!(matches.opt_str("shingle-length").map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None))
-                              .map_err(|e| Error::InvalidShingleLength(e)));
-    let similarity_threshold = try!(matches.opt_str("similarity-threshold").map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None))
-                                    .map_err(|e| Error::InvalidSimilarityThreshold(e)));
-    let band_min_probability = try!(matches.opt_str("band-min-probability").map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None))
-                                    .map_err(|e| Error::InvalidBandMinProbability(e)));
+    let signature_length = try_param_parse!(matches, "signature-length", InvalidSignatureLength);
+    let shingle_length = try_param_parse!(matches, "shingle-length", InvalidShingleLength);
+    let similarity_threshold = try_param_parse!(matches, "similarity-threshold", InvalidSimilarityThreshold);
+    let band_min_probability = try_param_parse!(matches, "band-min-probability", InvalidBandMinProbability);
+    let rotate_count = try_param_parse!(matches, "rotate-count", InvalidRotateCount);
 
     let app = try!(entrypoint(external_zmq_addr,
                               key_file,
@@ -77,7 +102,8 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
                               signature_length,
                               shingle_length,
                               similarity_threshold,
-                              band_min_probability));
+                              band_min_probability,
+                              rotate_count));
     shutdown_app(app)
 }
 
@@ -87,7 +113,8 @@ pub fn entrypoint(external_zmq_addr: String,
                   signature_length: Option<usize>,
                   shingle_length: Option<usize>,
                   similarity_threshold: Option<f64>,
-                  band_min_probability: Option<f64>) -> Result<App, Error>
+                  band_min_probability: Option<f64>,
+                  rotate_count: Option<usize>) -> Result<App, Error>
 {
     let mut zmq_ctx = zmq::Context::new();
     let mut ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -116,12 +143,13 @@ pub fn entrypoint(external_zmq_addr: String,
                    signature_length,
                    shingle_length,
                    similarity_threshold,
-                   band_min_probability).unwrap();
+                   band_min_probability,
+                   rotate_count).unwrap();
         slave_watchdog_tx.send(()).unwrap();
     }).unwrap();
 
     Ok(App {
-        zmq_ctx: zmq_ctx,
+        _zmq_ctx: zmq_ctx,
         master_thread: master_thread,
         master_watchdog_rx: master_watchdog_rx,
         slave_thread: slave_thread,
@@ -162,7 +190,7 @@ pub struct Message<R> {
     pub load: R,
 }
 
-fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Req<String>), Error> {
+fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Req<Arc<String>>), Error> {
     let mut frames = Vec::new();
     loop {
         frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
@@ -172,10 +200,10 @@ fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Req<String>), Err
     }
 
     let load_msg = frames.pop().unwrap();
-    Ok((Some(frames), try!(Req::decode(&load_msg).map_err(|e| Error::Proto(e))).0))
+    Ok((Some(frames), try!(Req::decode(&load_msg)).0))
 }
 
-fn tx_sock(packet: Rep<String>, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
+fn tx_sock(packet: Rep<Arc<String>>, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
     let required = packet.encode_len();
     let mut load_msg = try!(zmq::Message::with_capacity(required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
     packet.encode(&mut load_msg);
@@ -190,8 +218,8 @@ fn tx_sock(packet: Rep<String>, maybe_headers: Option<Headers>, sock: &mut zmq::
 
 fn master_loop(mut ext_sock: zmq::Socket,
                mut int_sock: zmq::Socket,
-               tx: Sender<Message<Req<String>>>,
-               rx: Receiver<Message<Rep<String>>>) -> Result<(), Error>
+               tx: Sender<Message<Req<Arc<String>>>>,
+               rx: Receiver<Message<Rep<Arc<String>>>>) -> Result<(), Error>
 {
     enum SlaveState { Online, Busy, Finished, }
     let mut slave_state = SlaveState::Online;
@@ -254,36 +282,145 @@ fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
         .map_err(|e| Error::Zmq(ZmqError::Send(e)))
 }
 
-fn rep_notify(rep: Rep<String>, headers: Option<Headers>, tx: &Sender<Message<Rep<String>>>, sock: &mut zmq::Socket) -> Result<(), Error> {
+fn rep_notify(rep: Rep<Arc<String>>, headers: Option<Headers>, tx: &Sender<Message<Rep<Arc<String>>>>, sock: &mut zmq::Socket) ->
+    Result<(), Error>
+{
     tx.send(Message { headers: headers, load: rep, }).unwrap();
     notify_sock(sock)
 }
 
+struct HashDuplEntry {
+    cluster_id: u64,
+    user_data: Arc<String>,
+}
+
+struct Processor {
+    hd: HashDupl<Tokens, InMemory<HashDuplEntry>>,
+    shingles: Shingles,
+    yauid: Yauid,
+    inserts_count: usize,
+    rotate_count: Option<usize>,
+}
+
+impl Processor {
+    fn new(config: Config, rotate_count: Option<usize>, key_file: String, node_id: Option<String>) -> Result<Processor, Error> {
+        let yauid = try!(if let Some(ref node_file) = node_id {
+            Yauid::with_node_id(&key_file, node_file)
+        } else {
+            Yauid::new(&key_file, 1)
+        });
+
+        let backend: InMemory<HashDuplEntry> = InMemory::new();
+        let hd = HashDupl::new(Tokens::new(), backend, config).unwrap();
+        let shingles = Shingles::new();
+
+        Ok(Processor {
+            hd: hd,
+            shingles: shingles,
+            yauid: yauid,
+            inserts_count: 0,
+            rotate_count: rotate_count,
+        })
+    }
+
+    fn handle(&mut self, LookupTask { text: doc_text, result: lookup_type, post_action: action, }: LookupTask<Arc<String>>) ->
+        Result<LookupResult<Arc<String>>, Error>
+    {
+        try!(self.hd.shinglify(doc_text, &mut self.shingles));
+        let signature = try!(self.hd.sign(&self.shingles));
+
+        let (rep, best_similarity) = match lookup_type {
+            LookupType::All => {
+                let mut best_similarity = None;
+                let mut matches: Vec<_> = try!(self.hd.lookup_all(signature.clone()))
+                    .into_iter()
+                    .map(|neighbour| Match {
+                        cluster_id: neighbour.document.cluster_id,
+                        similarity: neighbour.similarity,
+                        user_data: neighbour.document.user_data.clone(),
+                    })
+                    .inspect(|&Match { similarity: sim, .. }| if best_similarity.map(|best_sim| best_sim > sim).unwrap_or(true) {
+                        best_similarity = Some(sim)
+                    })
+                    .collect();
+
+                match matches.len() {
+                    0 => (LookupResult::EmptySet, None),
+                    1 => (LookupResult::Neighbours(Workload::Single(matches.pop().unwrap())), best_similarity),
+                    _ => (LookupResult::Neighbours(Workload::Many(matches)), best_similarity),
+                }
+            },
+            LookupType::Best | LookupType::BestOrMine =>
+                match try!(self.hd.lookup_best(signature.clone())) {
+                    None =>
+                        (LookupResult::EmptySet, None),
+                    Some(neighbour) =>
+                        (LookupResult::Best(Match {
+                            cluster_id: neighbour.document.cluster_id,
+                            similarity: neighbour.similarity,
+                            user_data: neighbour.document.user_data.clone(),
+                        }), Some(neighbour.similarity)),
+                },
+        };
+
+        if let Some(PostAction::InsertNew { assign: action_assign, user_data: action_data, .. }) =
+            match (best_similarity, &action) {
+                (_, &PostAction::None) =>
+                    None,
+                (None, &PostAction::InsertNew { .. }) =>
+                    Some(action),
+                (Some(..), &PostAction::InsertNew { cond: InsertCond::Always, .. }) =>
+                    Some(action),
+                (Some(best_sim), &PostAction::InsertNew { cond: InsertCond::BestSimLessThan(sim), .. }) if best_sim < sim =>
+                    Some(action),
+                (Some(..), &PostAction::InsertNew { .. }) =>
+                    None,
+            } {
+                let assigned_cluster_id = match action_assign {
+                    ClusterAssign::ServerChoice => try!(self.yauid.get_key()),
+                    ClusterAssign::ClientChoice(cluster_id) => cluster_id,
+                };
+                try!(self.hd.insert(signature, HashDuplEntry { cluster_id: assigned_cluster_id, user_data: action_data.clone(), }));
+
+                self.inserts_count += 1;
+                if self.rotate_count.map(|rotate_count| self.inserts_count >= rotate_count).unwrap_or(false) {
+                    try!(self.hd.backend_mut().rotate().map_err(|e| Error::HashDupl(hash_dupl::Error::Backend(e))));
+                    self.inserts_count = 0;
+                }
+
+                match lookup_type {
+                    LookupType::BestOrMine =>
+                        Ok(LookupResult::Best(Match {
+                            cluster_id: assigned_cluster_id,
+                            similarity: 1.0,
+                            user_data: action_data,
+                        })),
+                    _ => Ok(rep),
+                }
+            } else {
+                Ok(rep)
+            }
+    }
+}
+
 fn slave_loop(mut int_sock: zmq::Socket,
-              tx: Sender<Message<Rep<String>>>,
-              rx: Receiver<Message<Req<String>>>,
+              tx: Sender<Message<Rep<Arc<String>>>>,
+              rx: Receiver<Message<Req<Arc<String>>>>,
               key_file: String,
               node_id: Option<String>,
               signature_length: Option<usize>,
               shingle_length: Option<usize>,
               similarity_threshold: Option<f64>,
-              band_min_probability: Option<f64>) -> Result<(), Error>
+              band_min_probability: Option<f64>,
+              rotate_count: Option<usize>) -> Result<(), Error>
 {
-    let yauid = try!(if let Some(ref node_file) = node_id {
-        Yauid::with_node_id(&key_file, node_file)
-    } else {
-        Yauid::new(&key_file, 1)
-    }.map_err(|e| Error::Yauid(e)));
-
     let mut config = Config::default();
     signature_length.map(|v| config.signature_length = v);
     shingle_length.map(|v| config.shingle_length = v);
     similarity_threshold.map(|v| config.similarity_threshold = v);
     band_min_probability.map(|v| config.band_min_probability = v);
 
-    let mut hd: HashDupl<_, InMemory<String>> = HashDupl::new(Tokens::new(), InMemory::new(), config).unwrap();
-    let mut shingles = Shingles::new();
-
+    let mut processor = try!(Processor::new(config, rotate_count, key_file, node_id));
     loop {
         match rx.recv().unwrap() {
             Message { headers: hdrs, load: Req::Init, } =>
@@ -293,15 +430,15 @@ fn slave_loop(mut int_sock: zmq::Socket,
                 break;
             },
             Message { headers: hdrs, load: Req::Lookup(Workload::Single(task)), } => {
-                let rep = LookupResult::Error("todo single".to_owned());
+                let rep = try!(processor.handle(task));
                 try!(rep_notify(Rep::Result(Workload::Single(rep)), hdrs, &tx, &mut int_sock));
             },
             Message { headers: hdrs, load: Req::Lookup(Workload::Many(tasks)), } => {
-                let reps: Vec<_> = tasks
+                let maybe_reps: Result<Vec<_>, _> = tasks
                     .into_iter()
-                    .map(|task| LookupResult::Error("todo many".to_owned()))
+                    .map(|task| processor.handle(task))
                     .collect();
-                try!(rep_notify(Rep::Result(Workload::Many(reps)), hdrs, &tx, &mut int_sock));
+                try!(rep_notify(Rep::Result(Workload::Many(try!(maybe_reps))), hdrs, &tx, &mut int_sock));
             },
         }
     }
@@ -368,7 +505,7 @@ mod test {
                                  "/tmp/dupl_server_a.key".to_owned(),
                                  None, None, None, None, None).unwrap();
         {
-            let mut sock = app.zmq_ctx.socket(zmq::REQ).unwrap();
+            let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_a").unwrap();
             tx_sock(Req::Terminate, &mut sock);
             match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
