@@ -481,7 +481,7 @@ fn main() {
 #[cfg(test)]
 mod test {
     use zmq;
-    use dupl_server_proto::{Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult};
+    use dupl_server_proto::{Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult, Match};
     use dupl_server_proto::bin::{ToBin, FromBin};
     use super::{entrypoint, shutdown_app};
 
@@ -532,7 +532,7 @@ mod test {
             match rx_sock(&mut sock) { Rep::Result(Workload::Single(LookupResult::EmptySet)) => (), rep => panic!("unexpected rep: {:?}", rep), }
             // try to add something
             tx_sock(Req::Lookup(Workload::Many(vec![LookupTask {
-                text: "Free, and now Freer, monads free us from the boilerplate and let us concentrate on the essentials of side-effects.".to_owned(),
+                text: "cat dog mouse bird wolf bear fox hare".to_owned(),
                 result: LookupType::BestOrMine,
                 post_action: PostAction::InsertNew {
                     cond: InsertCond::Always,
@@ -540,7 +540,7 @@ mod test {
                     user_data: "1177".to_owned(),
                 },
             }, LookupTask {
-                text: "They let us write definitional interpreters for effects, bringing in the tool that worked in the program language.".to_owned(),
+                text: "elephant tiger lion jackal crocodile cat dog".to_owned(),
                 result: LookupType::Best,
                 post_action: PostAction::InsertNew {
                     cond: InsertCond::BestSimLessThan(1.0),
@@ -548,18 +548,75 @@ mod test {
                     user_data: "2288".to_owned(),
                 },
             }, LookupTask {
-                text: "The recently popularized Freer monad brought a predicament: Where does it fit in?".to_owned(),
+                text: "coyote cat dog mouse bird wolf bear fox".to_owned(),
+                result: LookupType::All,
+                post_action: PostAction::InsertNew {
+                    cond: InsertCond::BestSimLessThan(0.95),
+                    assign: ClusterAssign::ClientChoice(39),
+                    user_data: "3399".to_owned(),
+                },
+            }, LookupTask {
+                text: "tiger lion jackal crocodile cat dog".to_owned(),
                 result: LookupType::All,
                 post_action: PostAction::InsertNew {
                     cond: InsertCond::BestSimLessThan(0.5),
-                    assign: ClusterAssign::ClientChoice(39),
-                    user_data: "3399".to_owned(),
+                    assign: ClusterAssign::ClientChoice(40),
+                    user_data: "4400".to_owned(),
                 },
             }])), &mut sock);
             match rx_sock(&mut sock) {
                 Rep::Result(Workload::Many(ref workloads)) => {
-                    assert_eq!(workloads.len(), 3);
+                    assert_eq!(workloads.len(), 4);
+                    match workloads.get(0) {
+                        Some(&LookupResult::Best(Match { cluster_id: 17, similarity: 1.0, user_data: ref data, })) if data == "1177" => (),
+                        other => panic!("unexpected rep workload 0: {:?}", other),
+                    }
+                    match workloads.get(1) {
+                        Some(&LookupResult::EmptySet) => (),
+                        other => panic!("unexpected rep workload 1: {:?}", other),
+                    }
+                    match workloads.get(2) {
+                        Some(&LookupResult::Neighbours(Workload::Single(Match { cluster_id: 17, user_data: ref data, .. }))) if data == "1177" => (),
+                        other => panic!("unexpected rep workload 2: {:?}", other),
+                    }
+                    match workloads.get(3) {
+                        Some(&LookupResult::Neighbours(Workload::Single(Match { cluster_id: 28, user_data: ref data, .. }))) if data == "2288" => (),
+                        other => panic!("unexpected rep workload 3: {:?}", other),
+                    }
                 },
+                rep => panic!("unexpected rep: {:?}", rep),
+            }
+            // try to search common stuff, both should be found
+            tx_sock(Req::Lookup(Workload::Single(LookupTask {
+                text: "cat dog mouse bird wolf bear fox hare".to_owned(),
+                result: LookupType::All,
+                post_action: PostAction::None, })), &mut sock);
+            match rx_sock(&mut sock) {
+                Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Many(mut workloads)))) => {
+                    assert_eq!(workloads.len(), 2);
+                    workloads.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+                    match workloads.get(0) {
+                        Some(&Match { cluster_id: 17, similarity: sim, user_data: ref data, .. }) if sim >= 0.4 && data == "1177" => (),
+                        other => panic!("unexpected rep neighbour 0: {:?}", other),
+                    }
+                    match workloads.get(1) {
+                        Some(&Match { cluster_id: 39, similarity: sim, user_data: ref data, .. }) if sim >= 0.4 && data == "3399" => (),
+                        other => panic!("unexpected rep neighbour 1: {:?}", other),
+                    }
+                },
+                rep => panic!("unexpected rep: {:?}", rep),
+            }
+            // try to search next common stuff, only one should be found
+            tx_sock(Req::Lookup(Workload::Single(LookupTask {
+                text: "tiger lion jackal crocodile cat".to_owned(),
+                result: LookupType::All,
+                post_action: PostAction::None, })), &mut sock);
+            match rx_sock(&mut sock) {
+                Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Single(Match {
+                    cluster_id: 28,
+                    similarity: sim,
+                    user_data: ref data, ..
+                })))) if sim >= 0.4 && data == "2288" => (),
                 rep => panic!("unexpected rep: {:?}", rep),
             }
             // terminate
