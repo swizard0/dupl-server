@@ -481,7 +481,7 @@ fn main() {
 #[cfg(test)]
 mod test {
     use zmq;
-    use dupl_server_proto::{Req, Rep};
+    use dupl_server_proto::{Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult};
     use dupl_server_proto::bin::{ToBin, FromBin};
     use super::{entrypoint, shutdown_app};
 
@@ -503,10 +503,66 @@ mod test {
     fn start_stop() {
         let mut app = entrypoint("ipc:///tmp/dupl_server_a".to_owned(),
                                  "/tmp/dupl_server_a.key".to_owned(),
-                                 None, None, None, None, None).unwrap();
+                                 None, None, None, None, None, None).unwrap();
         {
             let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_a").unwrap();
+            tx_sock(Req::Init, &mut sock);
+            match rx_sock(&mut sock) { Rep::InitAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+            tx_sock(Req::Terminate, &mut sock);
+            match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+        }
+        shutdown_app(app).unwrap();
+    }
+
+    #[test]
+    fn insert_lookup() {
+        let mut app = entrypoint("ipc:///tmp/dupl_server_b".to_owned(),
+                                 "/tmp/dupl_server_b.key".to_owned(),
+                                 None, None, None, None, None, None).unwrap();
+        {
+            let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
+            sock.connect("ipc:///tmp/dupl_server_b").unwrap();
+            // initially empty: expect EmptySet
+            tx_sock(Req::Lookup(Workload::Single(LookupTask {
+                text: "arbitrary text".to_owned(),
+                result: LookupType::All,
+                post_action: PostAction::None,
+            })), &mut sock);
+            match rx_sock(&mut sock) { Rep::Result(Workload::Single(LookupResult::EmptySet)) => (), rep => panic!("unexpected rep: {:?}", rep), }
+            // try to add something
+            tx_sock(Req::Lookup(Workload::Many(vec![LookupTask {
+                text: "Free, and now Freer, monads free us from the boilerplate and let us concentrate on the essentials of side-effects.".to_owned(),
+                result: LookupType::BestOrMine,
+                post_action: PostAction::InsertNew {
+                    cond: InsertCond::Always,
+                    assign: ClusterAssign::ClientChoice(17),
+                    user_data: "1177".to_owned(),
+                },
+            }, LookupTask {
+                text: "They let us write definitional interpreters for effects, bringing in the tool that worked in the program language.".to_owned(),
+                result: LookupType::Best,
+                post_action: PostAction::InsertNew {
+                    cond: InsertCond::BestSimLessThan(1.0),
+                    assign: ClusterAssign::ClientChoice(28),
+                    user_data: "2288".to_owned(),
+                },
+            }, LookupTask {
+                text: "The recently popularized Freer monad brought a predicament: Where does it fit in?".to_owned(),
+                result: LookupType::All,
+                post_action: PostAction::InsertNew {
+                    cond: InsertCond::BestSimLessThan(0.5),
+                    assign: ClusterAssign::ClientChoice(39),
+                    user_data: "3399".to_owned(),
+                },
+            }])), &mut sock);
+            match rx_sock(&mut sock) {
+                Rep::Result(Workload::Many(ref workloads)) => {
+                    assert_eq!(workloads.len(), 3);
+                },
+                rep => panic!("unexpected rep: {:?}", rep),
+            }
+            // terminate
             tx_sock(Req::Terminate, &mut sock);
             match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
         }
