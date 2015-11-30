@@ -380,7 +380,7 @@ impl Processor {
                     ClusterAssign::ServerChoice => try!(self.yauid.get_key()),
                     ClusterAssign::ClientChoice(cluster_id) => cluster_id,
                 };
-                try!(self.hd.insert(signature, HashDuplEntry { cluster_id: assigned_cluster_id, user_data: action_data.clone(), }));
+                try!(self.hd.insert(signature, Arc::new(HashDuplEntry { cluster_id: assigned_cluster_id, user_data: action_data.clone(), })));
 
                 self.inserts_count += 1;
                 if self.rotate_count.map(|rotate_count| self.inserts_count >= rotate_count).unwrap_or(false) {
