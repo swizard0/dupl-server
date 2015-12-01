@@ -1,7 +1,9 @@
 extern crate zmq;
+extern crate serde;
 extern crate getopts;
 extern crate yauid;
 extern crate hash_dupl;
+extern crate bin_merge_pile;
 extern crate dupl_server_proto;
 
 use std::{io, env, process};
@@ -12,10 +14,12 @@ use std::thread::{Builder, sleep, JoinHandle};
 use std::num::{ParseFloatError, ParseIntError};
 use std::sync::mpsc::{channel, sync_channel, Sender, Receiver, TryRecvError};
 use getopts::Options;
+use serde::{Serialize, Serializer, Deserialize, Deserializer};
 use yauid::Yauid;
+use bin_merge_pile::merge::ParallelConfig;
 use hash_dupl::{HashDupl, Config, Shingles, Backend};
 use hash_dupl::shingler::tokens::Tokens;
-use hash_dupl::backend::in_memory::InMemory;
+use hash_dupl::backend::stream::{Params, Stream};
 use dupl_server_proto as proto;
 use dupl_server_proto::{
     Req, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign,
@@ -45,9 +49,14 @@ pub enum Error {
     InvalidShingleLength(ParseIntError),
     InvalidBandMinProbability(ParseFloatError),
     InvalidRotateCount(ParseIntError),
+    InvalidMinTreeHeight(ParseIntError),
+    InvalidMaxBlockSize(ParseIntError),
+    InvalidMemLimitPower(ParseIntError),
+    InvalidMergePileThreads(ParseIntError),
+    InvalidWindowsCount(ParseIntError),
     Zmq(ZmqError),
     Proto(proto::bin::Error),
-    HashDupl(hash_dupl::Error<(), ()>),
+    HashDupl(hash_dupl::Error<(), hash_dupl::backend::stream::Error>),
     Yauid(yauid::Error),
     MasterIsDown,
     SlaveIsDown,
@@ -59,8 +68,8 @@ impl From<proto::bin::Error> for Error {
     }
 }
 
-impl From<hash_dupl::Error<(), ()>> for Error {
-    fn from(err: hash_dupl::Error<(), ()>) -> Error {
+impl From<hash_dupl::Error<(), hash_dupl::backend::stream::Error>> for Error {
+    fn from(err: hash_dupl::Error<(), hash_dupl::backend::stream::Error>) -> Error {
         Error::HashDupl(err)
     }
 }
@@ -72,11 +81,38 @@ impl From<yauid::Error> for Error {
 }
 
 pub struct App {
-    _zmq_ctx: zmq::Context,
-    master_thread: JoinHandle<()>,
     master_watchdog_rx: Receiver<()>,
-    slave_thread: JoinHandle<()>,
     slave_watchdog_rx: Receiver<()>,
+    master_thread: Option<JoinHandle<()>>,
+    slave_thread: Option<JoinHandle<()>>,
+    _zmq_ctx: zmq::Context,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(slave_thread) = self.slave_thread.take() {
+            loop {
+                match self.slave_watchdog_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(TryRecvError::Empty) => (),
+                    Err(TryRecvError::Disconnected) => panic!("slave is down"),
+                }
+                sleep(std::time::Duration::from_millis(250));
+            }
+            slave_thread.join().unwrap();
+        }
+        if let Some(master_thread) = self.master_thread.take() {
+            loop {
+                match self.master_watchdog_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(TryRecvError::Empty) => (),
+                    Err(TryRecvError::Disconnected) => panic!("master is down"),
+                }
+                sleep(std::time::Duration::from_millis(250));
+            }
+            master_thread.join().unwrap();
+        }
+    }
 }
 
 macro_rules! try_param_parse {
@@ -88,33 +124,51 @@ macro_rules! try_param_parse {
 fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
     let external_zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./dupl_server.ipc".to_owned());
+    let database_dir = matches.opt_str("database").unwrap_or("windows".to_owned());
     let key_file = matches.opt_str("key-file").unwrap_or("/tmp/hbase.key".to_owned());
     let node_id = matches.opt_str("node-id");
+    let min_tree_height = try_param_parse!(matches, "min-tree-height", InvalidMinTreeHeight);
+    let max_block_size = try_param_parse!(matches, "max-block-size", InvalidMaxBlockSize);
+    let mem_limit_power = try_param_parse!(matches, "mem-limit-power", InvalidMemLimitPower);
+    let merge_pile_threads = try_param_parse!(matches, "merge-pile-threads", InvalidMergePileThreads);
+    let windows_count = try_param_parse!(matches, "windows-count", InvalidWindowsCount);
+    let rotate_count = try_param_parse!(matches, "rotate-count", InvalidRotateCount);
     let signature_length = try_param_parse!(matches, "signature-length", InvalidSignatureLength);
     let shingle_length = try_param_parse!(matches, "shingle-length", InvalidShingleLength);
     let similarity_threshold = try_param_parse!(matches, "similarity-threshold", InvalidSimilarityThreshold);
     let band_min_probability = try_param_parse!(matches, "band-min-probability", InvalidBandMinProbability);
-    let rotate_count = try_param_parse!(matches, "rotate-count", InvalidRotateCount);
 
-    let app = try!(entrypoint(external_zmq_addr,
-                              key_file,
-                              node_id,
-                              signature_length,
-                              shingle_length,
-                              similarity_threshold,
-                              band_min_probability,
-                              rotate_count));
-    shutdown_app(app)
+    let _app = try!(entrypoint(external_zmq_addr,
+                               database_dir,
+                               key_file,
+                               node_id,
+                               min_tree_height,
+                               max_block_size,
+                               mem_limit_power,
+                               merge_pile_threads,
+                               windows_count,
+                               rotate_count,
+                               signature_length,
+                               shingle_length,
+                               similarity_threshold,
+                               band_min_probability));
+    Ok(())
 }
 
 pub fn entrypoint(external_zmq_addr: String,
+                  database_dir: String,
                   key_file: String,
                   node_id: Option<String>,
+                  min_tree_height: Option<usize>,
+                  max_block_size: Option<usize>,
+                  mem_limit_power: Option<usize>,
+                  merge_pile_threads: Option<usize>,
+                  windows_count: Option<usize>,
+                  rotate_count: Option<usize>,
                   signature_length: Option<usize>,
                   shingle_length: Option<usize>,
                   similarity_threshold: Option<f64>,
-                  band_min_probability: Option<f64>,
-                  rotate_count: Option<usize>) -> Result<App, Error>
+                  band_min_probability: Option<f64>) -> Result<App, Error>
 {
     let mut zmq_ctx = zmq::Context::new();
     let mut ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -135,53 +189,32 @@ pub fn entrypoint(external_zmq_addr: String,
     }).unwrap();
 
     let slave_thread = Builder::new().name("slave thread".to_owned()).spawn(move || {
-        slave_loop(int_sock_slave,
+        slave_loop(database_dir,
+                   int_sock_slave,
                    slave_tx,
                    slave_rx,
                    key_file,
                    node_id,
+                   min_tree_height,
+                   max_block_size,
+                   mem_limit_power,
+                   merge_pile_threads,
+                   windows_count,
+                   rotate_count,
                    signature_length,
                    shingle_length,
                    similarity_threshold,
-                   band_min_probability,
-                   rotate_count).unwrap();
+                   band_min_probability).unwrap();
         slave_watchdog_tx.send(()).unwrap();
     }).unwrap();
 
     Ok(App {
-        _zmq_ctx: zmq_ctx,
-        master_thread: master_thread,
         master_watchdog_rx: master_watchdog_rx,
-        slave_thread: slave_thread,
         slave_watchdog_rx: slave_watchdog_rx,
+        master_thread: Some(master_thread),
+        slave_thread: Some(slave_thread),
+        _zmq_ctx: zmq_ctx,
     })
-}
-
-pub fn shutdown_app(app: App) -> Result<(), Error> {
-    let (mut master_finished, mut slave_finished) = (false, false);
-    while !master_finished && !slave_finished {
-        if !master_finished {
-            match app.master_watchdog_rx.try_recv() {
-                Ok(()) => master_finished = true,
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Disconnected) => return Err(Error::MasterIsDown),
-            }
-        }
-        if !slave_finished {
-            match app.slave_watchdog_rx.try_recv() {
-                Ok(()) => slave_finished = true,
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Disconnected) => return Err(Error::SlaveIsDown),
-            }
-        }
-
-        sleep(std::time::Duration::from_millis(250));
-    }
-
-    app.slave_thread.join().unwrap();
-    app.master_thread.join().unwrap();
-
-    Ok(())
 }
 
 pub type Headers = Vec<zmq::Message>;
@@ -294,23 +327,45 @@ struct HashDuplEntry {
     user_data: Arc<String>,
 }
 
+impl Serialize for HashDuplEntry {
+    fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error> where S: Serializer {
+        try!(self.cluster_id.serialize(serializer));
+        try!(self.user_data.serialize(serializer));
+        Ok(())
+    }
+}
+
+impl Deserialize for HashDuplEntry {
+    fn deserialize<D>(deserializer: &mut D) -> Result<HashDuplEntry, D::Error> where D: Deserializer {
+        Ok(HashDuplEntry {
+            cluster_id: try!(Deserialize::deserialize(deserializer)),
+            user_data: try!(Deserialize::deserialize(deserializer)),
+        })
+    }
+}
+
 struct Processor {
-    hd: HashDupl<Tokens, InMemory<HashDuplEntry>>,
+    hd: HashDupl<Tokens, Stream<HashDuplEntry>>,
     shingles: Shingles,
     yauid: Yauid,
     inserts_count: usize,
-    rotate_count: Option<usize>,
+    rotate_count: usize,
 }
 
 impl Processor {
-    fn new(config: Config, rotate_count: Option<usize>, key_file: String, node_id: Option<String>) -> Result<Processor, Error> {
+    fn new(config: Config,
+           params: Params,
+           database_dir: String,
+           rotate_count: Option<usize>,
+           key_file: String,
+           node_id: Option<String>) -> Result<Processor, Error> {
         let yauid = try!(if let Some(ref node_file) = node_id {
             Yauid::with_node_id(&key_file, node_file)
         } else {
             Yauid::new(&key_file, 1)
         });
 
-        let backend: InMemory<HashDuplEntry> = InMemory::new();
+        let backend = try!(Stream::new(database_dir, params).map_err(|e| hash_dupl::Error::Backend(e)));
         let hd = HashDupl::new(Tokens::new(), backend, config).unwrap();
         let shingles = Shingles::new();
 
@@ -319,7 +374,7 @@ impl Processor {
             shingles: shingles,
             yauid: yauid,
             inserts_count: 0,
-            rotate_count: rotate_count,
+            rotate_count: rotate_count.unwrap_or(131072),
         })
     }
 
@@ -383,7 +438,7 @@ impl Processor {
                 try!(self.hd.insert(signature, Arc::new(HashDuplEntry { cluster_id: assigned_cluster_id, user_data: action_data.clone(), })));
 
                 self.inserts_count += 1;
-                if self.rotate_count.map(|rotate_count| self.inserts_count >= rotate_count).unwrap_or(false) {
+                if self.inserts_count >= self.rotate_count {
                     try!(self.hd.backend_mut().rotate().map_err(|e| Error::HashDupl(hash_dupl::Error::Backend(e))));
                     self.inserts_count = 0;
                 }
@@ -403,24 +458,44 @@ impl Processor {
     }
 }
 
-fn slave_loop(mut int_sock: zmq::Socket,
+fn slave_loop(database_dir: String,
+              mut int_sock: zmq::Socket,
               tx: Sender<Message<Rep<Arc<String>>>>,
               rx: Receiver<Message<Req<Arc<String>>>>,
               key_file: String,
               node_id: Option<String>,
+              min_tree_height: Option<usize>,
+              max_block_size: Option<usize>,
+              mem_limit_power: Option<usize>,
+              merge_pile_threads: Option<usize>,
+              windows_count: Option<usize>,
+              rotate_count: Option<usize>,
               signature_length: Option<usize>,
               shingle_length: Option<usize>,
               similarity_threshold: Option<f64>,
-              band_min_probability: Option<f64>,
-              rotate_count: Option<usize>) -> Result<(), Error>
+              band_min_probability: Option<f64>) -> Result<(), Error>
 {
-    let mut config = Config::default();
+    let mut config: Config = Default::default();
     signature_length.map(|v| config.signature_length = v);
     shingle_length.map(|v| config.shingle_length = v);
     similarity_threshold.map(|v| config.similarity_threshold = v);
     band_min_probability.map(|v| config.band_min_probability = v);
 
-    let mut processor = try!(Processor::new(config, rotate_count, key_file, node_id));
+    let mut params: Params = Default::default();
+    min_tree_height.map(|v| params.compile_params.min_tree_height = v);
+    max_block_size.map(|v| params.compile_params.max_block_size = v);
+    mem_limit_power.map(|v| params.compile_params.memory_limit_power = v);
+    merge_pile_threads.map(|v| if v == 1 {
+        params.compile_params.parallel_config = ParallelConfig::SingleThread
+    } else if v > 1 {
+        params.compile_params.parallel_config = ParallelConfig::MultiThread {
+            max_slaves: v,
+            spawn_trigger_power: params.compile_params.memory_limit_power + 2,
+        }
+    });
+    windows_count.map(|v| params.windows_count = v);
+
+    let mut processor = try!(Processor::new(config, params, database_dir, rotate_count, key_file, node_id));
     loop {
         match rx.recv().unwrap() {
             Message { headers: hdrs, load: Req::Init, } =>
@@ -454,13 +529,13 @@ fn main() {
     opts.optopt("z", "zmq-addr", "server zeromq listen address (optional, default: ipc://./dupl_server.ipc)", "");
     opts.optopt("k", "key-file", "yauid key file to use (optional, default: /tmp/hbase.key)", "");
     opts.optopt("n", "node-id", " yauid node id file to use (optional, default: node id = 1)", "");
-    opts.optopt("d", "database", "database path for a backend (optional, default: no database path)", "");
-    opts.optopt("", "min-tree-height", "minimum tree height for mset backend (optional, default: 3)", "");
-    opts.optopt("", "lookup-index-mode", "one of index mode for mset_lookup backend: mmap or memory (optional, default: mmap)", "");
-    opts.optopt("", "lookup-docs-mode", "one of docs file read mode for mset_lookup backend: mmap or memory (optional, default: mmap)", "");
-    opts.optopt("", "lookup-slaves", "lookup workers count for mset_lookup, mset_rw and stream backends (optional, default: 2)", "");
-    opts.optopt("w", "windows-count", "windows count for stream backend (optional, default: 4)", "");
-    opts.optopt("r", "rotate-count", "windows rotate for stream backend for each 'count' documents inserted (optional, default: 128)", "");
+    opts.optopt("d", "database", "database path for a backend (optional, default: ./windows)", "");
+    opts.optopt("", "min-tree-height", "minimum tree height for NTree index (optional, default: 3)", "");
+    opts.optopt("", "max-block-size", "maximum block size for NTree index (optional, default: 64)", "");
+    opts.optopt("", "mem-limit-power", "power limit for memory part of bin-merge-pile index compiler (optional, default: 16)", "");
+    opts.optopt("", "merge-pile-threads", "number of threads for bin-merge-pile index compiler (optional, default: 1)", "");
+    opts.optopt("w", "windows-count", "windows count for stream backend (optional, default: 32)", "");
+    opts.optopt("r", "rotate-count", "windows rotate for stream backend for each 'count' documents inserted (optional, default: 32768)", "");
     opts.optopt("", "signature-length", "signature length hd param to use (optional)", "");
     opts.optopt("", "shingle-length", "shingle length hd param to use (optional)", "");
     opts.optopt("", "similarity-threshold", "similarity threshold hd param to use (optional)", "");
@@ -480,10 +555,11 @@ fn main() {
 
 #[cfg(test)]
 mod test {
+    use std::fs;
     use zmq;
     use dupl_server_proto::{Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult, Match};
     use dupl_server_proto::bin::{ToBin, FromBin};
-    use super::{entrypoint, shutdown_app};
+    use super::entrypoint;
 
     fn tx_sock(packet: Req<String>, sock: &mut zmq::Socket) {
         let required = packet.encode_len();
@@ -501,128 +577,126 @@ mod test {
 
     #[test]
     fn start_stop() {
+        let _ = fs::remove_dir_all("/tmp/windows_dupl_server_a");
         let mut app = entrypoint("ipc:///tmp/dupl_server_a".to_owned(),
+                                 "/tmp/windows_dupl_server_a".to_owned(),
                                  "/tmp/dupl_server_a.key".to_owned(),
-                                 None, None, None, None, None, None).unwrap();
-        {
-            let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
-            sock.connect("ipc:///tmp/dupl_server_a").unwrap();
-            tx_sock(Req::Init, &mut sock);
-            match rx_sock(&mut sock) { Rep::InitAck => (), rep => panic!("unexpected rep: {:?}", rep), }
-            tx_sock(Req::Terminate, &mut sock);
-            match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
-        }
-        shutdown_app(app).unwrap();
+                                 None, None, None, None, None, None, None, None, None, None, None).unwrap();
+        let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
+        sock.connect("ipc:///tmp/dupl_server_a").unwrap();
+        tx_sock(Req::Init, &mut sock);
+        match rx_sock(&mut sock) { Rep::InitAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+        tx_sock(Req::Terminate, &mut sock);
+        match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
     }
 
     #[test]
     fn insert_lookup() {
+        let _ = fs::remove_dir_all("/tmp/windows_dupl_server_b");
         let mut app = entrypoint("ipc:///tmp/dupl_server_b".to_owned(),
+                                 "/tmp/windows_dupl_server_b".to_owned(),
                                  "/tmp/dupl_server_b.key".to_owned(),
-                                 None, None, None, None, None, None).unwrap();
-        {
-            let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
-            sock.connect("ipc:///tmp/dupl_server_b").unwrap();
-            // initially empty: expect EmptySet
-            tx_sock(Req::Lookup(Workload::Single(LookupTask {
-                text: "arbitrary text".to_owned(),
-                result: LookupType::All,
-                post_action: PostAction::None,
-            })), &mut sock);
-            match rx_sock(&mut sock) { Rep::Result(Workload::Single(LookupResult::EmptySet)) => (), rep => panic!("unexpected rep: {:?}", rep), }
-            // try to add something
-            tx_sock(Req::Lookup(Workload::Many(vec![LookupTask {
-                text: "cat dog mouse bird wolf bear fox hare".to_owned(),
-                result: LookupType::BestOrMine,
-                post_action: PostAction::InsertNew {
-                    cond: InsertCond::Always,
-                    assign: ClusterAssign::ClientChoice(17),
-                    user_data: "1177".to_owned(),
-                },
-            }, LookupTask {
-                text: "elephant tiger lion jackal crocodile cat dog".to_owned(),
-                result: LookupType::Best,
-                post_action: PostAction::InsertNew {
-                    cond: InsertCond::BestSimLessThan(1.0),
-                    assign: ClusterAssign::ClientChoice(28),
-                    user_data: "2288".to_owned(),
-                },
-            }, LookupTask {
-                text: "coyote cat dog mouse bird wolf bear fox".to_owned(),
-                result: LookupType::All,
-                post_action: PostAction::InsertNew {
-                    cond: InsertCond::BestSimLessThan(0.95),
-                    assign: ClusterAssign::ClientChoice(39),
-                    user_data: "3399".to_owned(),
-                },
-            }, LookupTask {
-                text: "tiger lion jackal crocodile cat dog".to_owned(),
-                result: LookupType::All,
-                post_action: PostAction::InsertNew {
-                    cond: InsertCond::BestSimLessThan(0.5),
-                    assign: ClusterAssign::ClientChoice(40),
-                    user_data: "4400".to_owned(),
-                },
-            }])), &mut sock);
-            match rx_sock(&mut sock) {
-                Rep::Result(Workload::Many(ref workloads)) => {
-                    assert_eq!(workloads.len(), 4);
-                    match workloads.get(0) {
-                        Some(&LookupResult::Best(Match { cluster_id: 17, similarity: 1.0, user_data: ref data, })) if data == "1177" => (),
-                        other => panic!("unexpected rep workload 0: {:?}", other),
-                    }
-                    match workloads.get(1) {
-                        Some(&LookupResult::EmptySet) => (),
-                        other => panic!("unexpected rep workload 1: {:?}", other),
-                    }
-                    match workloads.get(2) {
-                        Some(&LookupResult::Neighbours(Workload::Single(Match { cluster_id: 17, user_data: ref data, .. }))) if data == "1177" => (),
-                        other => panic!("unexpected rep workload 2: {:?}", other),
-                    }
-                    match workloads.get(3) {
-                        Some(&LookupResult::Neighbours(Workload::Single(Match { cluster_id: 28, user_data: ref data, .. }))) if data == "2288" => (),
-                        other => panic!("unexpected rep workload 3: {:?}", other),
-                    }
-                },
-                rep => panic!("unexpected rep: {:?}", rep),
-            }
-            // try to search common stuff, both should be found
-            tx_sock(Req::Lookup(Workload::Single(LookupTask {
-                text: "cat dog mouse bird wolf bear fox hare".to_owned(),
-                result: LookupType::All,
-                post_action: PostAction::None, })), &mut sock);
-            match rx_sock(&mut sock) {
-                Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Many(mut workloads)))) => {
-                    assert_eq!(workloads.len(), 2);
-                    workloads.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
-                    match workloads.get(0) {
-                        Some(&Match { cluster_id: 17, similarity: sim, user_data: ref data, .. }) if sim >= 0.4 && data == "1177" => (),
-                        other => panic!("unexpected rep neighbour 0: {:?}", other),
-                    }
-                    match workloads.get(1) {
-                        Some(&Match { cluster_id: 39, similarity: sim, user_data: ref data, .. }) if sim >= 0.4 && data == "3399" => (),
-                        other => panic!("unexpected rep neighbour 1: {:?}", other),
-                    }
-                },
-                rep => panic!("unexpected rep: {:?}", rep),
-            }
-            // try to search next common stuff, only one should be found
-            tx_sock(Req::Lookup(Workload::Single(LookupTask {
-                text: "tiger lion jackal crocodile cat".to_owned(),
-                result: LookupType::All,
-                post_action: PostAction::None, })), &mut sock);
-            match rx_sock(&mut sock) {
-                Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Single(Match {
-                    cluster_id: 28,
-                    similarity: sim,
-                    user_data: ref data, ..
-                })))) if sim >= 0.4 && data == "2288" => (),
-                rep => panic!("unexpected rep: {:?}", rep),
-            }
-            // terminate
-            tx_sock(Req::Terminate, &mut sock);
-            match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+                                 None, None, None, None, None, None, None, None, None, None, None).unwrap();
+        let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
+        sock.connect("ipc:///tmp/dupl_server_b").unwrap();
+        // initially empty: expect EmptySet
+        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+            text: "arbitrary text".to_owned(),
+            result: LookupType::All,
+            post_action: PostAction::None,
+        })), &mut sock);
+        match rx_sock(&mut sock) { Rep::Result(Workload::Single(LookupResult::EmptySet)) => (), rep => panic!("unexpected rep: {:?}", rep), }
+        // try to add something
+        tx_sock(Req::Lookup(Workload::Many(vec![LookupTask {
+            text: "cat dog mouse bird wolf bear fox hare".to_owned(),
+            result: LookupType::BestOrMine,
+            post_action: PostAction::InsertNew {
+                cond: InsertCond::Always,
+                assign: ClusterAssign::ClientChoice(17),
+                user_data: "1177".to_owned(),
+            },
+        }, LookupTask {
+            text: "elephant tiger lion jackal crocodile cat dog".to_owned(),
+            result: LookupType::Best,
+            post_action: PostAction::InsertNew {
+                cond: InsertCond::BestSimLessThan(1.0),
+                assign: ClusterAssign::ClientChoice(28),
+                user_data: "2288".to_owned(),
+            },
+        }, LookupTask {
+            text: "coyote cat dog mouse bird wolf bear fox".to_owned(),
+            result: LookupType::All,
+            post_action: PostAction::InsertNew {
+                cond: InsertCond::BestSimLessThan(0.95),
+                assign: ClusterAssign::ClientChoice(39),
+                user_data: "3399".to_owned(),
+            },
+        }, LookupTask {
+            text: "tiger lion jackal crocodile cat dog".to_owned(),
+            result: LookupType::All,
+            post_action: PostAction::InsertNew {
+                cond: InsertCond::BestSimLessThan(0.5),
+                assign: ClusterAssign::ClientChoice(40),
+                user_data: "4400".to_owned(),
+            },
+        }])), &mut sock);
+        match rx_sock(&mut sock) {
+            Rep::Result(Workload::Many(ref workloads)) => {
+                assert_eq!(workloads.len(), 4);
+                match workloads.get(0) {
+                    Some(&LookupResult::Best(Match { cluster_id: 17, similarity: 1.0, user_data: ref data, })) if data == "1177" => (),
+                    other => panic!("unexpected rep workload 0: {:?}", other),
+                }
+                match workloads.get(1) {
+                    Some(&LookupResult::EmptySet) => (),
+                    other => panic!("unexpected rep workload 1: {:?}", other),
+                }
+                match workloads.get(2) {
+                    Some(&LookupResult::Neighbours(Workload::Single(Match { cluster_id: 17, user_data: ref data, .. }))) if data == "1177" => (),
+                    other => panic!("unexpected rep workload 2: {:?}", other),
+                }
+                match workloads.get(3) {
+                    Some(&LookupResult::Neighbours(Workload::Single(Match { cluster_id: 28, user_data: ref data, .. }))) if data == "2288" => (),
+                    other => panic!("unexpected rep workload 3: {:?}", other),
+                }
+            },
+            rep => panic!("unexpected rep: {:?}", rep),
         }
-        shutdown_app(app).unwrap();
+        // try to search common stuff, both should be found
+        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+            text: "cat dog mouse bird wolf bear fox hare".to_owned(),
+            result: LookupType::All,
+            post_action: PostAction::None, })), &mut sock);
+        match rx_sock(&mut sock) {
+            Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Many(mut workloads)))) => {
+                assert_eq!(workloads.len(), 2);
+                workloads.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+                match workloads.get(0) {
+                    Some(&Match { cluster_id: 17, similarity: sim, user_data: ref data, .. }) if sim >= 0.4 && data == "1177" => (),
+                    other => panic!("unexpected rep neighbour 0: {:?}", other),
+                }
+                match workloads.get(1) {
+                    Some(&Match { cluster_id: 39, similarity: sim, user_data: ref data, .. }) if sim >= 0.4 && data == "3399" => (),
+                    other => panic!("unexpected rep neighbour 1: {:?}", other),
+                }
+            },
+            rep => panic!("unexpected rep: {:?}", rep),
+        }
+        // try to search next common stuff, only one should be found
+        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+            text: "tiger lion jackal crocodile cat".to_owned(),
+            result: LookupType::All,
+            post_action: PostAction::None, })), &mut sock);
+        match rx_sock(&mut sock) {
+            Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Single(Match {
+                cluster_id: 28,
+                similarity: sim,
+                user_data: ref data, ..
+            })))) if sim >= 0.4 && data == "2288" => (),
+            rep => panic!("unexpected rep: {:?}", rep),
+        }
+        // terminate
+        tx_sock(Req::Terminate, &mut sock);
+        match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
     }
 }
