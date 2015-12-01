@@ -5,6 +5,7 @@ extern crate yauid;
 extern crate hash_dupl;
 extern crate bin_merge_pile;
 extern crate dupl_server_proto;
+#[cfg(test)] extern crate rand;
 
 use std::{io, env, process};
 use std::io::Write;
@@ -552,6 +553,7 @@ fn main() {
 mod test {
     use std::fs;
     use zmq;
+    use rand::{thread_rng, Rng};
     use dupl_server_proto::{Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult, Match};
     use dupl_server_proto::bin::{ToBin, FromBin};
     use super::entrypoint;
@@ -698,5 +700,82 @@ mod test {
         tx_sock(Req::Terminate, &mut sock);
         match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
         app.join();
+    }
+
+    fn gen_text() -> String {
+        let mut rng = thread_rng();
+        let total = 50 + (rng.gen::<usize>() % 50);
+        (0 .. total).map(|_| format!("{} ", rng.gen::<u8>())).collect()
+    }
+
+    #[test]
+    fn stress() {
+        let texts: Vec<_> = (0 .. 1000).map(|_| gen_text()).collect();
+        {
+            let _ = fs::remove_dir_all("/tmp/windows_dupl_server_c");
+            let mut app = entrypoint("ipc:///tmp/dupl_server_c".to_owned(),
+                                     "/tmp/windows_dupl_server_c".to_owned(),
+                                     "/tmp/dupl_server_c.key".to_owned(),
+                                     None, None, None, None, None, Some(8), Some(100), None, None, None, None).unwrap();
+            let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
+            sock.connect("ipc:///tmp/dupl_server_c").unwrap();
+
+            // check & fill
+            for (i, text) in texts.iter().enumerate() {
+                tx_sock(Req::Lookup(Workload::Single(LookupTask {
+                    text: text.clone(),
+                    result: LookupType::BestOrMine,
+                    post_action: PostAction::InsertNew {
+                        cond: InsertCond::Always,
+                        assign: ClusterAssign::ClientChoice(i as u64),
+                        user_data: text.clone(),
+                    },
+                })), &mut sock);
+                match rx_sock(&mut sock) {
+                    Rep::Result(Workload::Single(LookupResult::Best(Match {
+                        cluster_id: id,
+                        similarity: sim,
+                        user_data: ref data, ..
+                    }))) if sim >= 0.99 && id == i as u64 && data == text => (),
+                    rep => panic!("unexpected rep: {:?}", rep),
+                }
+            }
+
+            // terminate
+            tx_sock(Req::Terminate, &mut sock);
+            match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+            app.join();
+        }
+        {
+            let mut app = entrypoint("ipc:///tmp/dupl_server_c".to_owned(),
+                                     "/tmp/windows_dupl_server_c".to_owned(),
+                                     "/tmp/dupl_server_c.key".to_owned(),
+                                     None, None, None, None, None, Some(8), Some(100), None, None, None, None).unwrap();
+            let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
+            sock.connect("ipc:///tmp/dupl_server_c").unwrap();
+
+            // check
+            for (i, text) in texts.iter().enumerate() {
+                tx_sock(Req::Lookup(Workload::Single(LookupTask {
+                    text: text.clone(),
+                    result: LookupType::BestOrMine,
+                    post_action: PostAction::None,
+                })), &mut sock);
+                match rx_sock(&mut sock) {
+                    Rep::Result(Workload::Single(LookupResult::Best(Match {
+                        cluster_id: id,
+                        similarity: sim,
+                        user_data: ref data, ..
+                    }))) if i >= 200 && sim >= 0.99 && id == i as u64 && data == text => (),
+                    Rep::Result(Workload::Single(LookupResult::EmptySet)) if i < 200 => (),
+                    rep => panic!("unexpected rep: {:?}", rep),
+                }
+            }
+
+            // terminate
+            tx_sock(Req::Terminate, &mut sock);
+            match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+            app.join();
+        }
     }
 }

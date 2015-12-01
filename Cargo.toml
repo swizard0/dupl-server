@@ -1,6 +1,6 @@
 [package]
 name = "dupl-server"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
@@ -11,3 +11,6 @@ bin-merge-pile = { git = "https://bitbucket.org/swizard/bin-merge-pile.git" }
 dupl_server_proto = { path = "dupl-server-proto" }
 hash-dupl = { git = "git://dev.swizard.info/hash-dupl" }
 yauid-rs = { git = "git://dev.swizard.info/yauid-rs" }
+
+[dev-dependencies]
+rand = "*"
