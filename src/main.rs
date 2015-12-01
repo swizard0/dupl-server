@@ -88,29 +88,25 @@ pub struct App {
     _zmq_ctx: zmq::Context,
 }
 
-impl Drop for App {
-    fn drop(&mut self) {
-        if let Some(slave_thread) = self.slave_thread.take() {
-            loop {
+impl App {
+    fn join(&mut self) {
+        while self.slave_thread.is_some() || self.master_thread.is_some() {
+            if self.slave_thread.is_some() {
                 match self.slave_watchdog_rx.try_recv() {
-                    Ok(()) => break,
+                    Ok(()) => { self.slave_thread.take().map(|slave_thread| { let _ = slave_thread.join(); }); },
                     Err(TryRecvError::Empty) => (),
-                    Err(TryRecvError::Disconnected) => panic!("slave is down"),
+                    Err(TryRecvError::Disconnected) => return,
                 }
-                sleep(std::time::Duration::from_millis(250));
             }
-            slave_thread.join().unwrap();
-        }
-        if let Some(master_thread) = self.master_thread.take() {
-            loop {
+            if self.master_thread.is_some() {
                 match self.master_watchdog_rx.try_recv() {
-                    Ok(()) => break,
+                    Ok(()) => { self.master_thread.take().map(|master_thread| { let _ = master_thread.join(); }); },
                     Err(TryRecvError::Empty) => (),
-                    Err(TryRecvError::Disconnected) => panic!("master is down"),
+                    Err(TryRecvError::Disconnected) => return,
                 }
-                sleep(std::time::Duration::from_millis(250));
             }
-            master_thread.join().unwrap();
+
+            sleep(std::time::Duration::from_millis(250));
         }
     }
 }
@@ -138,20 +134,20 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     let similarity_threshold = try_param_parse!(matches, "similarity-threshold", InvalidSimilarityThreshold);
     let band_min_probability = try_param_parse!(matches, "band-min-probability", InvalidBandMinProbability);
 
-    let _app = try!(entrypoint(external_zmq_addr,
-                               database_dir,
-                               key_file,
-                               node_id,
-                               min_tree_height,
-                               max_block_size,
-                               mem_limit_power,
-                               merge_pile_threads,
-                               windows_count,
-                               rotate_count,
-                               signature_length,
-                               shingle_length,
-                               similarity_threshold,
-                               band_min_probability));
+    try!(entrypoint(external_zmq_addr,
+                    database_dir,
+                    key_file,
+                    node_id,
+                    min_tree_height,
+                    max_block_size,
+                    mem_limit_power,
+                    merge_pile_threads,
+                    windows_count,
+                    rotate_count,
+                    signature_length,
+                    shingle_length,
+                    similarity_threshold,
+                    band_min_probability)).join();
     Ok(())
 }
 
@@ -383,7 +379,6 @@ impl Processor {
     {
         try!(self.hd.shinglify(doc_text, &mut self.shingles));
         let signature = try!(self.hd.sign(&self.shingles));
-
         let (rep, best_similarity) = match lookup_type {
             LookupType::All => {
                 let mut best_similarity = None;
@@ -569,6 +564,9 @@ mod test {
     }
 
     fn rx_sock(sock: &mut zmq::Socket) -> Rep<String> {
+        if zmq::poll(&mut [sock.as_poll_item(zmq::POLLIN)], 2500).unwrap() == 0 {
+            panic!("rx_sock timed out")
+        }
         let msg = sock.recv_msg(0).unwrap();
         assert!(!sock.get_rcvmore().unwrap());
         let (rep, _) = Rep::decode(&msg).unwrap();
@@ -588,6 +586,7 @@ mod test {
         match rx_sock(&mut sock) { Rep::InitAck => (), rep => panic!("unexpected rep: {:?}", rep), }
         tx_sock(Req::Terminate, &mut sock);
         match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+        app.join();
     }
 
     #[test]
@@ -698,5 +697,6 @@ mod test {
         // terminate
         tx_sock(Req::Terminate, &mut sock);
         match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+        app.join();
     }
 }
