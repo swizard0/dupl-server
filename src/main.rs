@@ -1,5 +1,6 @@
 extern crate zmq;
 extern crate serde;
+extern crate ctrlc;
 extern crate getopts;
 extern crate yauid;
 extern crate hash_dupl;
@@ -27,6 +28,8 @@ use dupl_server_proto::{
     Rep, LookupResult, Match,
 };
 use dupl_server_proto::bin::{ToBin, FromBin};
+
+mod signal;
 
 const INTERNAL_SOCKET_ADDR: &'static str = "inproc://internal";
 
@@ -59,8 +62,6 @@ pub enum Error {
     Proto(proto::bin::Error),
     HashDupl(hash_dupl::Error<(), hash_dupl::backend::stream::Error>),
     Yauid(yauid::Error),
-    MasterIsDown,
-    SlaveIsDown,
 }
 
 impl From<proto::bin::Error> for Error {
@@ -135,6 +136,7 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     let similarity_threshold = try_param_parse!(matches, "similarity-threshold", InvalidSimilarityThreshold);
     let band_min_probability = try_param_parse!(matches, "band-min-probability", InvalidBandMinProbability);
 
+    signal::term_on_signal(&external_zmq_addr);
     try!(entrypoint(external_zmq_addr,
                     database_dir,
                     key_file,
