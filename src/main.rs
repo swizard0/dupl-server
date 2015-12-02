@@ -8,8 +8,8 @@ extern crate bin_merge_pile;
 extern crate dupl_server_proto;
 #[cfg(test)] extern crate rand;
 
-use std::{io, env, process};
-use std::io::Write;
+use std::{io, fs, env, process};
+use std::io::{Write, BufRead};
 use std::sync::Arc;
 use std::convert::From;
 use std::thread::{Builder, sleep, JoinHandle};
@@ -58,6 +58,8 @@ pub enum Error {
     InvalidMemLimitPower(ParseIntError),
     InvalidMergePileThreads(ParseIntError),
     InvalidWindowsCount(ParseIntError),
+    OpenStopDict(String, io::Error),
+    ReadStopDict(String, io::Error),
     Zmq(ZmqError),
     Proto(proto::bin::Error),
     HashDupl(hash_dupl::Error<(), hash_dupl::backend::stream::Error>),
@@ -119,6 +121,28 @@ macro_rules! try_param_parse {
     })
 }
 
+pub fn default_stop_dict() -> Vec<String> {
+    let words = ["or", "and", ".", "...", ",", "?", "!", "…", "\"", "http", "://", "-", "t", "co", ":", "/"];
+    words.iter().map(|&w| w.to_owned()).collect()
+}
+
+fn make_stop_dict(maybe_filename: Option<String>, additional_words: Vec<String>) -> Result<Vec<String>, Error> {
+    let mut dict = if additional_words.is_empty() { default_stop_dict() } else { additional_words };
+    if let Some(filename) = maybe_filename {
+        let fd = try!(fs::File::open(&filename).map_err(|e| Error::OpenStopDict(filename.clone(), e)));
+        let reader = io::BufReader::new(fd);
+        for maybe_line in reader.lines() {
+            let line = try!(maybe_line.map_err(|e| Error::ReadStopDict(filename.clone(), e)));
+            let trimmed_line = line.trim_matches(|c: char| c.is_whitespace() || c == '.');
+            if trimmed_line.is_empty() || trimmed_line.starts_with("//") {
+                continue;
+            }
+            dict.push(trimmed_line.to_owned());
+        }
+    }
+    Ok(dict)
+}
+
 fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
     let external_zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./dupl_server.ipc".to_owned());
@@ -135,6 +159,7 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     let shingle_length = try_param_parse!(matches, "shingle-length", InvalidShingleLength);
     let similarity_threshold = try_param_parse!(matches, "similarity-threshold", InvalidSimilarityThreshold);
     let band_min_probability = try_param_parse!(matches, "band-min-probability", InvalidBandMinProbability);
+    let stop_words = try!(make_stop_dict(matches.opt_str("stop-dict"), matches.opt_strs("sd")));
 
     signal::term_on_signal(&external_zmq_addr);
     try!(entrypoint(external_zmq_addr,
@@ -150,7 +175,8 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
                     signature_length,
                     shingle_length,
                     similarity_threshold,
-                    band_min_probability)).join();
+                    band_min_probability,
+                    stop_words)).join();
     Ok(())
 }
 
@@ -167,7 +193,8 @@ pub fn entrypoint(external_zmq_addr: String,
                   signature_length: Option<usize>,
                   shingle_length: Option<usize>,
                   similarity_threshold: Option<f64>,
-                  band_min_probability: Option<f64>) -> Result<App, Error>
+                  band_min_probability: Option<f64>,
+                  stop_words: Vec<String>) -> Result<App, Error>
 {
     let mut zmq_ctx = zmq::Context::new();
     let mut ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -203,7 +230,8 @@ pub fn entrypoint(external_zmq_addr: String,
                    signature_length,
                    shingle_length,
                    similarity_threshold,
-                   band_min_probability).unwrap();
+                   band_min_probability,
+                   stop_words).unwrap();
         slave_watchdog_tx.send(()).unwrap();
     }).unwrap();
 
@@ -355,6 +383,7 @@ impl Processor {
     fn new(config: Config,
            params: Params,
            database_dir: String,
+           stop_words: Vec<String>,
            rotate_count: Option<usize>,
            key_file: String,
            node_id: Option<String>) -> Result<Processor, Error> {
@@ -365,7 +394,9 @@ impl Processor {
         });
 
         let backend = try!(Stream::new(database_dir, params).map_err(|e| hash_dupl::Error::Backend(e)));
-        let hd = HashDupl::new(Tokens::new(), backend, config).unwrap();
+        let mut tokenizer = Tokens::new();
+        try!(tokenizer.set_stop_words::<_, Error>(stop_words.into_iter().map(|v| Ok(v))));
+        let hd = HashDupl::new(tokenizer, backend, config).unwrap();
         let shingles = Shingles::new();
 
         Ok(Processor {
@@ -471,7 +502,8 @@ fn slave_loop(database_dir: String,
               signature_length: Option<usize>,
               shingle_length: Option<usize>,
               similarity_threshold: Option<f64>,
-              band_min_probability: Option<f64>) -> Result<(), Error>
+              band_min_probability: Option<f64>,
+              stop_words: Vec<String>) -> Result<(), Error>
 {
     let mut config: Config = Default::default();
     signature_length.map(|v| config.signature_length = v);
@@ -493,7 +525,7 @@ fn slave_loop(database_dir: String,
     });
     windows_count.map(|v| params.windows_count = v);
 
-    let mut processor = try!(Processor::new(config, params, database_dir, rotate_count, key_file, node_id));
+    let mut processor = try!(Processor::new(config, params, database_dir, stop_words, rotate_count, key_file, node_id));
     loop {
         match rx.recv().unwrap() {
             Message { headers: hdrs, load: Req::Init, } =>
@@ -538,6 +570,8 @@ fn main() {
     opts.optopt("", "shingle-length", "shingle length hd param to use (optional)", "");
     opts.optopt("", "similarity-threshold", "similarity threshold hd param to use (optional)", "");
     opts.optopt("", "band-min-probability", "band minimum probability hd param to use (optional)", "");
+    opts.optopt("s", "stop-dict", "stop words file (optional, replaces default)", "");
+    opts.optmulti("", "sd", "additional stop word for hash-dupl (optional, may be provided several times)", "");
 
     match bootstrap(opts.parse(args)) {
         Ok(()) =>
@@ -558,7 +592,7 @@ mod test {
     use rand::{thread_rng, Rng};
     use dupl_server_proto::{Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult, Match};
     use dupl_server_proto::bin::{ToBin, FromBin};
-    use super::entrypoint;
+    use super::{entrypoint, default_stop_dict};
 
     fn tx_sock(packet: Req<String>, sock: &mut zmq::Socket) {
         let required = packet.encode_len();
@@ -583,7 +617,7 @@ mod test {
         let mut app = entrypoint("ipc:///tmp/dupl_server_a".to_owned(),
                                  "/tmp/windows_dupl_server_a".to_owned(),
                                  "/tmp/dupl_server_a.key".to_owned(),
-                                 None, None, None, None, None, None, None, None, None, None, None).unwrap();
+                                 None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_a").unwrap();
         tx_sock(Req::Init, &mut sock);
@@ -599,7 +633,7 @@ mod test {
         let mut app = entrypoint("ipc:///tmp/dupl_server_b".to_owned(),
                                  "/tmp/windows_dupl_server_b".to_owned(),
                                  "/tmp/dupl_server_b.key".to_owned(),
-                                 None, None, None, None, None, None, None, None, None, None, None).unwrap();
+                                 None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_b").unwrap();
         // initially empty: expect EmptySet
@@ -712,13 +746,13 @@ mod test {
 
     #[test]
     fn stress() {
-        let texts: Vec<_> = (0 .. 1000).map(|_| gen_text()).collect();
+        let texts: Vec<_> = (0 .. 100).map(|_| gen_text()).collect();
         {
             let _ = fs::remove_dir_all("/tmp/windows_dupl_server_c");
             let mut app = entrypoint("ipc:///tmp/dupl_server_c".to_owned(),
                                      "/tmp/windows_dupl_server_c".to_owned(),
                                      "/tmp/dupl_server_c.key".to_owned(),
-                                     None, None, None, None, None, Some(8), Some(100), None, None, None, None).unwrap();
+                                     None, None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict()).unwrap();
             let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_c").unwrap();
 
@@ -752,7 +786,7 @@ mod test {
             let mut app = entrypoint("ipc:///tmp/dupl_server_c".to_owned(),
                                      "/tmp/windows_dupl_server_c".to_owned(),
                                      "/tmp/dupl_server_c.key".to_owned(),
-                                     None, None, None, None, None, Some(8), Some(100), None, None, None, None).unwrap();
+                                     None, None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict()).unwrap();
             let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_c").unwrap();
 
@@ -768,8 +802,8 @@ mod test {
                         cluster_id: id,
                         similarity: sim,
                         user_data: ref data, ..
-                    }))) if i >= 200 && sim >= 0.99 && id == i as u64 && data == text => (),
-                    Rep::Result(Workload::Single(LookupResult::EmptySet)) if i < 200 => (),
+                    }))) if i >= 20 && sim >= 0.99 && id == i as u64 && data == text => (),
+                    Rep::Result(Workload::Single(LookupResult::EmptySet)) if i < 20 => (),
                     rep => panic!("unexpected rep: {:?}", rep),
                 }
             }
@@ -779,5 +813,73 @@ mod test {
             match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
             app.join();
         }
+    }
+
+    #[test]
+    fn stop_words() {
+        let _ = fs::remove_dir_all("/tmp/windows_dupl_server_d");
+        let mut app = entrypoint("ipc:///tmp/dupl_server_d".to_owned(),
+                                 "/tmp/windows_dupl_server_d".to_owned(),
+                                 "/tmp/dupl_server_d.key".to_owned(),
+                                 None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
+        let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
+        sock.connect("ipc:///tmp/dupl_server_d").unwrap();
+
+        let text_a = "The explicit continuation of FFree also makes it easier to change its representation.".to_owned();
+        let text_b = "The, explicit and continuation. of? FFree! also-makes http://t.co it easier to \"change\" its representation.".to_owned();
+
+        // add text_a
+        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+            text: text_a.clone(),
+            result: LookupType::BestOrMine,
+            post_action: PostAction::InsertNew {
+                cond: InsertCond::Always,
+                assign: ClusterAssign::ClientChoice(177),
+                user_data: text_a.clone(),
+            },
+        })), &mut sock);
+        match rx_sock(&mut sock) {
+            Rep::Result(Workload::Single(LookupResult::Best(Match {
+                cluster_id: 177,
+                similarity: sim,
+                user_data: ref data, ..
+            }))) if sim >= 0.99 && data == &text_a => (),
+            rep => panic!("unexpected rep: {:?}", rep),
+        }
+
+        // check text_a
+        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+            text: text_a.clone(),
+            result: LookupType::BestOrMine,
+            post_action: PostAction::None,
+        })), &mut sock);
+        match rx_sock(&mut sock) {
+            Rep::Result(Workload::Single(LookupResult::Best(Match {
+                cluster_id: 177,
+                similarity: sim,
+                user_data: ref data, ..
+            }))) if sim >= 0.99 && data == &text_a => (),
+            rep => panic!("unexpected rep: {:?}", rep),
+        }
+
+        // check text_b
+        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+            text: text_b.clone(),
+            result: LookupType::BestOrMine,
+            post_action: PostAction::None,
+        })), &mut sock);
+        match rx_sock(&mut sock) {
+            Rep::Result(Workload::Single(LookupResult::Best(Match {
+                cluster_id: 177,
+                similarity: sim,
+                user_data: ref data, ..
+            }))) if sim >= 0.99 && data == &text_a => (),
+            rep => panic!("unexpected rep: {:?}", rep),
+        }
+
+        // terminate
+        tx_sock(Req::Terminate, &mut sock);
+        match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+        app.join();
     }
 }
