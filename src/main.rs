@@ -818,15 +818,19 @@ mod test {
     #[test]
     fn stop_words() {
         let _ = fs::remove_dir_all("/tmp/windows_dupl_server_d");
+        let mut custom_stop_dict = default_stop_dict();
+        custom_stop_dict.push("javascript".to_owned());
+        custom_stop_dict.push("php".to_owned());
         let mut app = entrypoint("ipc:///tmp/dupl_server_d".to_owned(),
                                  "/tmp/windows_dupl_server_d".to_owned(),
                                  "/tmp/dupl_server_d.key".to_owned(),
-                                 None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
+                                 None, None, None, None, None, None, None, None, None, None, None, custom_stop_dict).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_d").unwrap();
 
         let text_a = "The explicit continuation of FFree also makes it easier to change its representation.".to_owned();
-        let text_b = "The, explicit and continuation. of? FFree! also-makes http://t.co it easier to \"change\" its representation.".to_owned();
+        let text_b = "The, explicit and continuation. of? FFree! also-makes http://t.co it easier php to \"change\" its javascript representation."
+            .to_owned();
 
         // add text_a
         tx_sock(Req::Lookup(Workload::Single(LookupTask {
