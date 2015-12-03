@@ -535,15 +535,15 @@ fn slave_loop(database_dir: String,
                 break;
             },
             Message { headers: hdrs, load: Req::Lookup(Workload::Single(task)), } => {
-                let rep = try!(processor.handle(task));
+                let rep = processor.handle(task).unwrap_or_else(|e| LookupResult::Error(format!("{:?}", e)));
                 try!(rep_notify(Rep::Result(Workload::Single(rep)), hdrs, &tx, &mut int_sock));
             },
             Message { headers: hdrs, load: Req::Lookup(Workload::Many(tasks)), } => {
-                let maybe_reps: Result<Vec<_>, _> = tasks
+                let reps: Vec<_> = tasks
                     .into_iter()
-                    .map(|task| processor.handle(task))
+                    .map(|task| processor.handle(task).unwrap_or_else(|e| LookupResult::Error(format!("{:?}", e))))
                     .collect();
-                try!(rep_notify(Rep::Result(Workload::Many(try!(maybe_reps))), hdrs, &tx, &mut int_sock));
+                try!(rep_notify(Rep::Result(Workload::Many(reps)), hdrs, &tx, &mut int_sock));
             },
         }
     }
