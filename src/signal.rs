@@ -1,6 +1,6 @@
 use zmq;
 use ctrlc::CtrlC;
-use dupl_server_proto::{Req, Rep};
+use dupl_server_proto::{Trans, Req, Rep};
 use dupl_server_proto::bin::{ToBin, FromBin};
 use super::ZmqError;
 
@@ -12,7 +12,7 @@ pub fn term_on_signal(external_zmq_addr: &str) {
         sock.connect(&external_zmq_addr_owned).map_err(|e| ZmqError::Connect(external_zmq_addr_owned.clone(), e)).unwrap();
         println!(" ;; SIGINT received, terminating server...");
         loop {
-            let packet: Req<String> = Req::Terminate;
+            let packet: Trans<String> = Trans::Sync(Req::Terminate);
             let required = packet.encode_len();
             let mut load_msg = zmq::Message::with_capacity(required).map_err(|e| ZmqError::Message(e)).unwrap();
             packet.encode(&mut load_msg);
