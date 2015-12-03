@@ -24,7 +24,7 @@ use hash_dupl::shingler::tokens::Tokens;
 use hash_dupl::backend::stream::{Params, Stream};
 use dupl_server_proto as proto;
 use dupl_server_proto::{
-    Req, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign,
+    Trans, Req, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign,
     Rep, LookupResult, Match,
 };
 use dupl_server_proto::bin::{ToBin, FromBin};
@@ -250,7 +250,7 @@ pub struct Message<R> {
     pub load: R,
 }
 
-fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Req<Arc<String>>), Error> {
+fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Trans<Arc<String>>), Error> {
     let mut frames = Vec::new();
     loop {
         frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
@@ -260,7 +260,7 @@ fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Req<Arc<String>>)
     }
 
     let load_msg = frames.pop().unwrap();
-    Ok((Some(frames), try!(Req::decode(&load_msg)).0))
+    Ok((Some(frames), try!(Trans::decode(&load_msg)).0))
 }
 
 fn tx_sock(packet: Rep<Arc<String>>, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
@@ -283,6 +283,7 @@ fn master_loop(mut ext_sock: zmq::Socket,
 {
     enum SlaveState { Online, Busy, Finished, }
     let mut slave_state = SlaveState::Online;
+    let mut req_queue = Vec::new();
     loop {
         let (ext_sock_online, int_sock_online) = {
             let mut pollitems = [ext_sock.as_poll_item(zmq::POLLIN), int_sock.as_poll_item(zmq::POLLIN)];
@@ -323,17 +324,29 @@ fn master_loop(mut ext_sock: zmq::Socket,
         }
 
         if ext_sock_online {
-            match (try!(rx_sock(&mut ext_sock)), &slave_state) {
-                ((headers, req), &SlaveState::Online) => {
+            req_queue.push(try!(rx_sock(&mut ext_sock)))
+        }
+
+        let mut req_queue_skipped = Vec::new();
+        for req_data in req_queue {
+            match (req_data, &slave_state) {
+                ((headers, Trans::Async(req)), &SlaveState::Online) => {
                     tx.send(Message { headers: headers, load: req, }).unwrap();
                     slave_state = SlaveState::Busy;
                 },
-                ((headers, _), &SlaveState::Busy) =>
+                ((headers, Trans::Sync(req)), &SlaveState::Online) => {
+                    tx.send(Message { headers: headers, load: req, }).unwrap();
+                    slave_state = SlaveState::Busy;
+                },
+                ((headers, Trans::Async(..)), &SlaveState::Busy) =>
                     try!(tx_sock(Rep::TooBusy, headers, &mut ext_sock)),
+                ((headers, trans @ Trans::Sync(..)), &SlaveState::Busy) =>
+                    req_queue_skipped.push((headers, trans)),
                 (_, &SlaveState::Finished) =>
                     unreachable!(),
             }
         }
+        req_queue = req_queue_skipped;
     }
 }
 
@@ -590,11 +603,11 @@ mod test {
     use std::fs;
     use zmq;
     use rand::{thread_rng, Rng};
-    use dupl_server_proto::{Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult, Match};
+    use dupl_server_proto::{Trans, Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult, Match};
     use dupl_server_proto::bin::{ToBin, FromBin};
     use super::{entrypoint, default_stop_dict};
 
-    fn tx_sock(packet: Req<String>, sock: &mut zmq::Socket) {
+    fn tx_sock(packet: Trans<String>, sock: &mut zmq::Socket) {
         let required = packet.encode_len();
         let mut msg = zmq::Message::with_capacity(required).unwrap();
         packet.encode(&mut msg);
@@ -620,9 +633,9 @@ mod test {
                                  None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_a").unwrap();
-        tx_sock(Req::Init, &mut sock);
+        tx_sock(Trans::Sync(Req::Init), &mut sock);
         match rx_sock(&mut sock) { Rep::InitAck => (), rep => panic!("unexpected rep: {:?}", rep), }
-        tx_sock(Req::Terminate, &mut sock);
+        tx_sock(Trans::Sync(Req::Terminate), &mut sock);
         match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
         app.join();
     }
@@ -637,14 +650,14 @@ mod test {
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_b").unwrap();
         // initially empty: expect EmptySet
-        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+        tx_sock(Trans::Async(Req::Lookup(Workload::Single(LookupTask {
             text: "arbitrary text".to_owned(),
             result: LookupType::All,
             post_action: PostAction::None,
-        })), &mut sock);
+        }))), &mut sock);
         match rx_sock(&mut sock) { Rep::Result(Workload::Single(LookupResult::EmptySet)) => (), rep => panic!("unexpected rep: {:?}", rep), }
         // try to add something
-        tx_sock(Req::Lookup(Workload::Many(vec![LookupTask {
+        tx_sock(Trans::Sync(Req::Lookup(Workload::Many(vec![LookupTask {
             text: "cat dog mouse bird wolf bear fox hare".to_owned(),
             result: LookupType::BestOrMine,
             post_action: PostAction::InsertNew {
@@ -676,7 +689,7 @@ mod test {
                 assign: ClusterAssign::ClientChoice(40),
                 user_data: "4400".to_owned(),
             },
-        }])), &mut sock);
+        }]))), &mut sock);
         match rx_sock(&mut sock) {
             Rep::Result(Workload::Many(ref workloads)) => {
                 assert_eq!(workloads.len(), 4);
@@ -700,10 +713,10 @@ mod test {
             rep => panic!("unexpected rep: {:?}", rep),
         }
         // try to search common stuff, both should be found
-        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+        tx_sock(Trans::Async(Req::Lookup(Workload::Single(LookupTask {
             text: "cat dog mouse bird wolf bear fox hare".to_owned(),
             result: LookupType::All,
-            post_action: PostAction::None, })), &mut sock);
+            post_action: PostAction::None, }))), &mut sock);
         match rx_sock(&mut sock) {
             Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Many(mut workloads)))) => {
                 assert_eq!(workloads.len(), 2);
@@ -720,10 +733,10 @@ mod test {
             rep => panic!("unexpected rep: {:?}", rep),
         }
         // try to search next common stuff, only one should be found
-        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+        tx_sock(Trans::Sync(Req::Lookup(Workload::Single(LookupTask {
             text: "tiger lion jackal crocodile cat".to_owned(),
             result: LookupType::All,
-            post_action: PostAction::None, })), &mut sock);
+            post_action: PostAction::None, }))), &mut sock);
         match rx_sock(&mut sock) {
             Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Single(Match {
                 cluster_id: 28,
@@ -733,7 +746,7 @@ mod test {
             rep => panic!("unexpected rep: {:?}", rep),
         }
         // terminate
-        tx_sock(Req::Terminate, &mut sock);
+        tx_sock(Trans::Async(Req::Terminate), &mut sock);
         match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
         app.join();
     }
@@ -758,7 +771,7 @@ mod test {
 
             // check & fill
             for (i, text) in texts.iter().enumerate() {
-                tx_sock(Req::Lookup(Workload::Single(LookupTask {
+                tx_sock(Trans::Async(Req::Lookup(Workload::Single(LookupTask {
                     text: text.clone(),
                     result: LookupType::BestOrMine,
                     post_action: PostAction::InsertNew {
@@ -766,7 +779,7 @@ mod test {
                         assign: ClusterAssign::ClientChoice(i as u64),
                         user_data: text.clone(),
                     },
-                })), &mut sock);
+                }))), &mut sock);
                 match rx_sock(&mut sock) {
                     Rep::Result(Workload::Single(LookupResult::Best(Match {
                         cluster_id: id,
@@ -778,7 +791,7 @@ mod test {
             }
 
             // terminate
-            tx_sock(Req::Terminate, &mut sock);
+            tx_sock(Trans::Sync(Req::Terminate), &mut sock);
             match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
             app.join();
         }
@@ -792,11 +805,11 @@ mod test {
 
             // check
             for (i, text) in texts.iter().enumerate() {
-                tx_sock(Req::Lookup(Workload::Single(LookupTask {
+                tx_sock(Trans::Async(Req::Lookup(Workload::Single(LookupTask {
                     text: text.clone(),
                     result: LookupType::BestOrMine,
                     post_action: PostAction::None,
-                })), &mut sock);
+                }))), &mut sock);
                 match rx_sock(&mut sock) {
                     Rep::Result(Workload::Single(LookupResult::Best(Match {
                         cluster_id: id,
@@ -809,7 +822,7 @@ mod test {
             }
 
             // terminate
-            tx_sock(Req::Terminate, &mut sock);
+            tx_sock(Trans::Sync(Req::Terminate), &mut sock);
             match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
             app.join();
         }
@@ -833,7 +846,7 @@ mod test {
             .to_owned();
 
         // add text_a
-        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+        tx_sock(Trans::Async(Req::Lookup(Workload::Single(LookupTask {
             text: text_a.clone(),
             result: LookupType::BestOrMine,
             post_action: PostAction::InsertNew {
@@ -841,7 +854,7 @@ mod test {
                 assign: ClusterAssign::ClientChoice(177),
                 user_data: text_a.clone(),
             },
-        })), &mut sock);
+        }))), &mut sock);
         match rx_sock(&mut sock) {
             Rep::Result(Workload::Single(LookupResult::Best(Match {
                 cluster_id: 177,
@@ -852,11 +865,11 @@ mod test {
         }
 
         // check text_a
-        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+        tx_sock(Trans::Async(Req::Lookup(Workload::Single(LookupTask {
             text: text_a.clone(),
             result: LookupType::BestOrMine,
             post_action: PostAction::None,
-        })), &mut sock);
+        }))), &mut sock);
         match rx_sock(&mut sock) {
             Rep::Result(Workload::Single(LookupResult::Best(Match {
                 cluster_id: 177,
@@ -867,11 +880,11 @@ mod test {
         }
 
         // check text_b
-        tx_sock(Req::Lookup(Workload::Single(LookupTask {
+        tx_sock(Trans::Sync(Req::Lookup(Workload::Single(LookupTask {
             text: text_b.clone(),
             result: LookupType::BestOrMine,
             post_action: PostAction::None,
-        })), &mut sock);
+        }))), &mut sock);
         match rx_sock(&mut sock) {
             Rep::Result(Workload::Single(LookupResult::Best(Match {
                 cluster_id: 177,
@@ -882,7 +895,7 @@ mod test {
         }
 
         // terminate
-        tx_sock(Req::Terminate, &mut sock);
+        tx_sock(Trans::Async(Req::Terminate), &mut sock);
         match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
         app.join();
     }
