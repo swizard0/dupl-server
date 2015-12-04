@@ -24,7 +24,7 @@ use hash_dupl::shingler::tokens::Tokens;
 use hash_dupl::backend::stream::{Params, Stream};
 use dupl_server_proto as proto;
 use dupl_server_proto::{
-    Trans, Req, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign,
+    Trans, Req, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, AssignCond, ClusterChoice,
     Rep, LookupResult, Match,
 };
 use dupl_server_proto::bin::{ToBin, FromBin};
@@ -436,8 +436,8 @@ impl Processor {
                         similarity: neighbour.similarity,
                         user_data: neighbour.document.user_data.clone(),
                     })
-                    .inspect(|&Match { similarity: sim, .. }| if best_similarity.map(|best_sim| best_sim > sim).unwrap_or(true) {
-                        best_similarity = Some(sim)
+                    .inspect(|&Match { similarity: sim, cluster_id: c, .. }| if best_similarity.map(|(best_sim, _)| best_sim > sim).unwrap_or(true) {
+                        best_similarity = Some((sim, c))
                     })
                     .collect();
 
@@ -456,7 +456,7 @@ impl Processor {
                             cluster_id: neighbour.document.cluster_id,
                             similarity: neighbour.similarity,
                             user_data: neighbour.document.user_data.clone(),
-                        }), Some(neighbour.similarity)),
+                        }), Some((neighbour.similarity, neighbour.document.cluster_id))),
                 },
         };
 
@@ -468,15 +468,33 @@ impl Processor {
                     Some(action),
                 (Some(..), &PostAction::InsertNew { cond: InsertCond::Always, .. }) =>
                     Some(action),
-                (Some(best_sim), &PostAction::InsertNew { cond: InsertCond::BestSimLessThan(sim), .. }) if best_sim < sim =>
+                (Some((best_sim, _)), &PostAction::InsertNew { cond: InsertCond::BestSimLessThan(sim), .. }) if best_sim < sim =>
                     Some(action),
                 (Some(..), &PostAction::InsertNew { .. }) =>
                     None,
             } {
-                let assigned_cluster_id = match action_assign {
-                    ClusterAssign::ServerChoice => try!(self.yauid.get_key()),
-                    ClusterAssign::ClientChoice(cluster_id) => cluster_id,
+                let assign_choice = match (best_similarity, action_assign) {
+                    (_, ClusterAssign { cond: AssignCond::Always, choice: c, }) =>
+                        Ok(c),
+                    (None, ClusterAssign { cond: AssignCond::BestSimLessThan(..), choice: c, }) =>
+                        Ok(c),
+                    (Some((best_sim, cluster_id)), ClusterAssign { cond: AssignCond::BestSimLessThan(sim), choice: c, }) =>
+                        if best_sim < sim {
+                            Ok(c)
+                        } else {
+                            Err(cluster_id)
+                        },
                 };
+
+                let assigned_cluster_id = match assign_choice {
+                    Ok(ClusterChoice::ServerChoice) =>
+                        try!(self.yauid.get_key()),
+                    Ok(ClusterChoice::ClientChoice(cluster_id)) =>
+                        cluster_id,
+                    Err(cluster_id) =>
+                        cluster_id,
+                };
+
                 try!(self.hd.insert(signature, Arc::new(HashDuplEntry { cluster_id: assigned_cluster_id, user_data: action_data.clone(), })));
 
                 self.inserts_count += 1;
@@ -603,7 +621,8 @@ mod test {
     use std::fs;
     use zmq;
     use rand::{thread_rng, Rng};
-    use dupl_server_proto::{Trans, Req, Rep, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, LookupResult, Match};
+    use dupl_server_proto::{Trans, Req, Rep, Workload, LookupTask, LookupType, PostAction};
+    use dupl_server_proto::{InsertCond, ClusterAssign, ClusterChoice, AssignCond, LookupResult, Match};
     use dupl_server_proto::bin::{ToBin, FromBin};
     use super::{entrypoint, default_stop_dict};
 
@@ -662,7 +681,10 @@ mod test {
             result: LookupType::BestOrMine,
             post_action: PostAction::InsertNew {
                 cond: InsertCond::Always,
-                assign: ClusterAssign::ClientChoice(17),
+                assign: ClusterAssign {
+                    cond: AssignCond::Always,
+                    choice: ClusterChoice::ClientChoice(17),
+                },
                 user_data: "1177".to_owned(),
             },
         }, LookupTask {
@@ -670,7 +692,10 @@ mod test {
             result: LookupType::Best,
             post_action: PostAction::InsertNew {
                 cond: InsertCond::BestSimLessThan(1.0),
-                assign: ClusterAssign::ClientChoice(28),
+                assign: ClusterAssign {
+                    cond: AssignCond::Always,
+                    choice: ClusterChoice::ClientChoice(28),
+                },
                 user_data: "2288".to_owned(),
             },
         }, LookupTask {
@@ -678,7 +703,10 @@ mod test {
             result: LookupType::All,
             post_action: PostAction::InsertNew {
                 cond: InsertCond::BestSimLessThan(0.95),
-                assign: ClusterAssign::ClientChoice(39),
+                assign: ClusterAssign {
+                    cond: AssignCond::Always,
+                    choice: ClusterChoice::ClientChoice(39),
+                },
                 user_data: "3399".to_owned(),
             },
         }, LookupTask {
@@ -686,7 +714,10 @@ mod test {
             result: LookupType::All,
             post_action: PostAction::InsertNew {
                 cond: InsertCond::BestSimLessThan(0.5),
-                assign: ClusterAssign::ClientChoice(40),
+                assign: ClusterAssign {
+                    cond: AssignCond::Always,
+                    choice: ClusterChoice::ClientChoice(40),
+                },
                 user_data: "4400".to_owned(),
             },
         }]))), &mut sock);
@@ -776,7 +807,10 @@ mod test {
                     result: LookupType::BestOrMine,
                     post_action: PostAction::InsertNew {
                         cond: InsertCond::Always,
-                        assign: ClusterAssign::ClientChoice(i as u64),
+                        assign: ClusterAssign {
+                            cond: AssignCond::Always,
+                            choice: ClusterChoice::ClientChoice(i as u64),
+                        },
                         user_data: text.clone(),
                     },
                 }))), &mut sock);
@@ -851,7 +885,10 @@ mod test {
             result: LookupType::BestOrMine,
             post_action: PostAction::InsertNew {
                 cond: InsertCond::Always,
-                assign: ClusterAssign::ClientChoice(177),
+                assign: ClusterAssign {
+                    cond: AssignCond::Always,
+                    choice: ClusterChoice::ClientChoice(177),
+                },
                 user_data: text_a.clone(),
             },
         }))), &mut sock);
@@ -899,4 +936,78 @@ mod test {
         match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
         app.join();
     }
+
+    #[test]
+    fn insert_cluster_best_sim() {
+        let _ = fs::remove_dir_all("/tmp/windows_dupl_server_e");
+        let mut app = entrypoint("ipc:///tmp/dupl_server_e".to_owned(),
+                                 "/tmp/windows_dupl_server_e".to_owned(),
+                                 "/tmp/dupl_server_e.key".to_owned(),
+                                 None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
+        let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
+        sock.connect("ipc:///tmp/dupl_server_e").unwrap();
+        // try to add something
+        tx_sock(Trans::Sync(Req::Lookup(Workload::Many(vec![LookupTask {
+            text: "cat dog mouse bird wolf bear fox hare".to_owned(),
+            result: LookupType::BestOrMine,
+            post_action: PostAction::InsertNew {
+                cond: InsertCond::Always,
+                assign: ClusterAssign {
+                    cond: AssignCond::Always,
+                    choice: ClusterChoice::ClientChoice(17),
+                },
+                user_data: "1177".to_owned(),
+            },
+        }, LookupTask {
+            text: "cat dog mouse bird wolf bear fox".to_owned(),
+            result: LookupType::Best,
+            post_action: PostAction::InsertNew {
+                cond: InsertCond::BestSimLessThan(1.0),
+                assign: ClusterAssign {
+                    cond: AssignCond::BestSimLessThan(0.6),
+                    choice: ClusterChoice::ServerChoice,
+                },
+                user_data: "2288".to_owned(),
+            },
+        }]))), &mut sock);
+        match rx_sock(&mut sock) {
+            Rep::Result(Workload::Many(ref workloads)) => {
+                assert_eq!(workloads.len(), 2);
+                match workloads.get(0) {
+                    Some(&LookupResult::Best(Match { cluster_id: 17, similarity: 1.0, user_data: ref data, })) if data == "1177" => (),
+                    other => panic!("unexpected rep workload 0: {:?}", other),
+                }
+                match workloads.get(1) {
+                    Some(&LookupResult::Best(Match { cluster_id: 17, similarity: sim, user_data: ref data, })) if sim >= 0.6 && data == "1177" => (),
+                    other => panic!("unexpected rep workload 1: {:?}", other),
+                }
+            },
+            rep => panic!("unexpected rep: {:?}", rep),
+        }
+        // try to search common stuff, both should be found
+        tx_sock(Trans::Async(Req::Lookup(Workload::Single(LookupTask {
+            text: "cat dog mouse bird wolf bear fox".to_owned(),
+            result: LookupType::All,
+            post_action: PostAction::None, }))), &mut sock);
+        match rx_sock(&mut sock) {
+            Rep::Result(Workload::Single(LookupResult::Neighbours(Workload::Many(mut workloads)))) => {
+                assert_eq!(workloads.len(), 2);
+                workloads.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+                match workloads.get(0) {
+                    Some(&Match { cluster_id: 17, similarity: 1.0, user_data: ref data, .. }) if data == "2288" => (),
+                    other => panic!("unexpected rep neighbour 0: {:?}", other),
+                }
+                match workloads.get(1) {
+                    Some(&Match { cluster_id: 17, similarity: sim, user_data: ref data, .. }) if sim >= 0.6 && data == "1177" => (),
+                    other => panic!("unexpected rep neighbour 1: {:?}", other),
+                }
+            },
+            rep => panic!("unexpected rep: {:?}", rep),
+        }
+        // terminate
+        tx_sock(Trans::Async(Req::Terminate), &mut sock);
+        match rx_sock(&mut sock) { Rep::TerminateAck => (), rep => panic!("unexpected rep: {:?}", rep), }
+        app.join();
+    }
+
 }
