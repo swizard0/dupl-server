@@ -1,9 +1,9 @@
 extern crate zmq;
 extern crate serde;
-extern crate ctrlc;
 extern crate getopts;
 extern crate yauid;
 extern crate hash_dupl;
+extern crate simple_signal;
 extern crate bin_merge_pile;
 extern crate dupl_server_proto;
 #[cfg(test)] extern crate rand;

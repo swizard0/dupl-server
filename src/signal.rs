@@ -1,12 +1,12 @@
 use zmq;
-use ctrlc::CtrlC;
+use simple_signal::{Signals, Signal};
 use dupl_server_proto::{Trans, Req, Rep};
 use dupl_server_proto::bin::{ToBin, FromBin};
 use super::ZmqError;
 
 pub fn term_on_signal(external_zmq_addr: &str) {
     let external_zmq_addr_owned = external_zmq_addr.to_owned();
-    CtrlC::set_handler(move || {
+    Signals::set_handler(&[Signal::Hup, Signal::Int, Signal::Quit, Signal::Abrt, Signal::Term], move |_signals| {
         let mut zmq_ctx = zmq::Context::new();
         let mut sock = zmq_ctx.socket(zmq::REQ).map_err(|e| ZmqError::Socket(e)).unwrap();
         sock.connect(&external_zmq_addr_owned).map_err(|e| ZmqError::Connect(external_zmq_addr_owned.clone(), e)).unwrap();
