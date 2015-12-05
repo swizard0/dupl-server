@@ -4,6 +4,7 @@ extern crate getopts;
 extern crate yauid;
 extern crate hash_dupl;
 extern crate simple_signal;
+extern crate unix_daemonize;
 extern crate bin_merge_pile;
 extern crate dupl_server_proto;
 #[cfg(test)] extern crate rand;
@@ -22,6 +23,7 @@ use bin_merge_pile::merge::ParallelConfig;
 use hash_dupl::{HashDupl, Config, Shingles, Backend};
 use hash_dupl::shingler::tokens::Tokens;
 use hash_dupl::backend::stream::{Params, Stream};
+use unix_daemonize::{daemonize_redirect, ChdirMode};
 use dupl_server_proto as proto;
 use dupl_server_proto::{
     Trans, Req, Workload, LookupTask, LookupType, PostAction, InsertCond, ClusterAssign, AssignCond, ClusterChoice,
@@ -60,6 +62,9 @@ pub enum Error {
     InvalidWindowsCount(ParseIntError),
     OpenStopDict(String, io::Error),
     ReadStopDict(String, io::Error),
+    Daemonize(unix_daemonize::Error),
+    CreatePidFile(String, io::Error),
+    WritePidFile(String, io::Error),
     Zmq(ZmqError),
     Proto(proto::bin::Error),
     HashDupl(hash_dupl::Error<(), hash_dupl::backend::stream::Error>),
@@ -160,6 +165,18 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     let similarity_threshold = try_param_parse!(matches, "similarity-threshold", InvalidSimilarityThreshold);
     let band_min_probability = try_param_parse!(matches, "band-min-probability", InvalidBandMinProbability);
     let stop_words = try!(make_stop_dict(matches.opt_str("stop-dict"), matches.opt_strs("sd")));
+    let daemonize = matches.opt_present("daemonize");
+    let redirect_stdout = matches.opt_str("redirect-stdout");
+    let redirect_stderr = matches.opt_str("redirect-stderr");
+    let pid_file = matches.opt_str("pid-file");
+
+    if daemonize {
+        let pid = try!(daemonize_redirect(redirect_stdout, redirect_stderr, ChdirMode::NoChdir).map_err(|e| Error::Daemonize(e)));
+        if let Some(file) = pid_file {
+            let mut fd = try!(fs::File::create(&file).map_err(|e| Error::CreatePidFile(file.clone(), e)));
+            try!(writeln!(&mut fd, "{}", pid).map_err(|e| Error::WritePidFile(file.clone(), e)));
+        }
+    }
 
     signal::term_on_signal(&external_zmq_addr);
     try!(entrypoint(external_zmq_addr,
@@ -602,6 +619,10 @@ fn main() {
     opts.optopt("", "similarity-threshold", "similarity threshold hd param to use (optional)", "");
     opts.optopt("", "band-min-probability", "band minimum probability hd param to use (optional)", "");
     opts.optopt("s", "stop-dict", "stop words file (optional, replaces default)", "");
+    opts.optflag("", "daemonize", "daemonize server (optional, default: no daemonize)");
+    opts.optopt("", "redirect-stdout", "redirect stdout to given file when daemonize (optional, default: /dev/null)", "");
+    opts.optopt("", "redirect-stderr", "redirect stderr to given file when daemonize (optional, default: /dev/null)", "");
+    opts.optopt("", "pid-file", "save pid of the process into this file (optional, default: no save)", "");
     opts.optmulti("", "sd", "additional stop word for hash-dupl (optional, may be provided several times)", "");
 
     match bootstrap(opts.parse(args)) {
