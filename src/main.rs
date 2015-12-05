@@ -172,13 +172,15 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
 
     if daemonize {
         let pid = try!(daemonize_redirect(redirect_stdout, redirect_stderr, ChdirMode::NoChdir).map_err(|e| Error::Daemonize(e)));
+        println!("Daemonized with pid = {:?}", pid);
         if let Some(file) = pid_file {
             let mut fd = try!(fs::File::create(&file).map_err(|e| Error::CreatePidFile(file.clone(), e)));
-            try!(writeln!(&mut fd, "{}", pid).map_err(|e| Error::WritePidFile(file.clone(), e)));
+            try!(write!(&mut fd, "{}", pid).map_err(|e| Error::WritePidFile(file.clone(), e)));
         }
     }
 
     signal::term_on_signal(&external_zmq_addr);
+    println!("Server started");
     try!(entrypoint(external_zmq_addr,
                     database_dir,
                     key_file,
@@ -194,6 +196,7 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
                     similarity_threshold,
                     band_min_probability,
                     stop_words)).join();
+    println!("Server terminated");
     Ok(())
 }
 
