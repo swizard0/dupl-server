@@ -7,7 +7,7 @@ authors = ["Alexey Voznyuk <me@swizard.info>"]
 getopts = "*"
 serde = "*"
 simple-signal = "1.0"
-unix-daemonize = { git = "git://dev.swizard.info/unix-daemonize" }
+unix-daemonize = "0.1"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
 bin-merge-pile = { git = "https://bitbucket.org/swizard/bin-merge-pile.git" }
 dupl_server_proto = { path = "dupl-server-proto" }
