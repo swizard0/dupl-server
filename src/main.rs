@@ -60,6 +60,7 @@ pub enum Error {
     InvalidMemLimitPower(ParseIntError),
     InvalidMergePileThreads(ParseIntError),
     InvalidWindowsCount(ParseIntError),
+    NoNodeIdFileProvided,
     OpenStopDict(String, io::Error),
     ReadStopDict(String, io::Error),
     Daemonize(unix_daemonize::Error),
@@ -420,12 +421,16 @@ impl Processor {
            rotate_count: Option<usize>,
            key_file: String,
            node_id: Option<String>) -> Result<Processor, Error> {
-        let yauid = try!(if let Some(ref node_file) = node_id {
-            Yauid::with_node_id(&key_file, node_file)
-        } else {
-            Yauid::new(&key_file, 1)
-        });
 
+        let node_file: &str = if fs::metadata("/etc/node.id").as_ref().map(fs::Metadata::is_file).unwrap_or(false) {
+            "/etc/node.id"
+        } else if let Some(ref node_file) = node_id {
+            &*node_file
+        } else {
+            return Err(Error::NoNodeIdFileProvided)
+        };
+
+        let yauid = try!(Yauid::with_node_id(&key_file, node_file));
         let backend = try!(Stream::new(database_dir, params).map_err(|e| hash_dupl::Error::Backend(e)));
         let mut tokenizer = Tokens::new();
         try!(tokenizer.set_stop_words::<_, Error>(stop_words.into_iter().map(|v| Ok(v))));
@@ -609,7 +614,7 @@ fn main() {
 
     opts.optopt("z", "zmq-addr", "server zeromq listen address (optional, default: ipc://./dupl_server.ipc)", "");
     opts.optopt("k", "key-file", "yauid key file to use (optional, default: /tmp/hbase.key)", "");
-    opts.optopt("n", "node-id", " yauid node id file to use (optional, default: node id = 1)", "");
+    opts.optopt("n", "node-id", " yauid node id file to use if no /etc/node.id found (optional, default: /etc/node.id)", "");
     opts.optopt("d", "database", "database path for a backend (optional, default: ./windows)", "");
     opts.optopt("", "min-tree-height", "minimum tree height for NTree index (optional, default: 3)", "");
     opts.optopt("", "max-block-size", "maximum block size for NTree index (optional, default: 64)", "");
