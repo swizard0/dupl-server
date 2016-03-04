@@ -4,8 +4,8 @@ version = "0.6.3"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
-getopts = "*"
-serde = "*"
+getopts = "0.2"
+serde = "0.6"
 simple-signal = "1.0"
 unix-daemonize = "0.1"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
@@ -15,4 +15,4 @@ hash-dupl = { git = "git://dev.swizard.info/hash-dupl" }
 yauid-rs = { git = "git://dev.swizard.info/yauid-rs" }
 
 [dev-dependencies]
-rand = "*"
+rand = "0.3"
