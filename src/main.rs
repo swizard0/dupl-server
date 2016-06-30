@@ -648,6 +648,7 @@ fn main() {
 #[cfg(test)]
 mod test {
     use std::fs;
+    use std::io::Write;
     use zmq;
     use rand::{thread_rng, Rng};
     use dupl_server_proto::{Trans, Req, Rep, Workload, LookupTask, LookupType, PostAction};
@@ -672,13 +673,21 @@ mod test {
         rep
     }
 
+    fn ensure_tmp_node_id() {
+        let mut node_id = fs::File::create("/tmp/node.id").unwrap();
+        let digits = "9019".as_bytes();
+        node_id.write_all(digits).unwrap();
+    }
+
     #[test]
     fn start_stop() {
+        ensure_tmp_node_id();
         let _ = fs::remove_dir_all("/tmp/windows_dupl_server_a");
         let mut app = entrypoint("ipc:///tmp/dupl_server_a".to_owned(),
                                  "/tmp/windows_dupl_server_a".to_owned(),
                                  "/tmp/dupl_server_a.key".to_owned(),
-                                 None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
+                                 Some("/tmp/node.id".to_owned()),
+                                 None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_a").unwrap();
         tx_sock(Trans::Sync(Req::Init), &mut sock);
@@ -690,11 +699,13 @@ mod test {
 
     #[test]
     fn insert_lookup() {
+        ensure_tmp_node_id();
         let _ = fs::remove_dir_all("/tmp/windows_dupl_server_b");
         let mut app = entrypoint("ipc:///tmp/dupl_server_b".to_owned(),
                                  "/tmp/windows_dupl_server_b".to_owned(),
                                  "/tmp/dupl_server_b.key".to_owned(),
-                                 None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
+                                 Some("/tmp/node.id".to_owned()),
+                                 None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_b").unwrap();
         // initially empty: expect EmptySet
@@ -821,11 +832,13 @@ mod test {
     fn stress() {
         let texts: Vec<_> = (0 .. 100).map(|_| gen_text()).collect();
         {
+            ensure_tmp_node_id();
             let _ = fs::remove_dir_all("/tmp/windows_dupl_server_c");
             let mut app = entrypoint("ipc:///tmp/dupl_server_c".to_owned(),
                                      "/tmp/windows_dupl_server_c".to_owned(),
                                      "/tmp/dupl_server_c.key".to_owned(),
-                                     None, None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict()).unwrap();
+                                     Some("/tmp/node.id".to_owned()),
+                                     None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict()).unwrap();
             let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_c").unwrap();
 
@@ -862,7 +875,8 @@ mod test {
             let mut app = entrypoint("ipc:///tmp/dupl_server_c".to_owned(),
                                      "/tmp/windows_dupl_server_c".to_owned(),
                                      "/tmp/dupl_server_c.key".to_owned(),
-                                     None, None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict()).unwrap();
+                                     Some("/tmp/node.id".to_owned()),
+                                     None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict()).unwrap();
             let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_c").unwrap();
 
@@ -893,6 +907,7 @@ mod test {
 
     #[test]
     fn stop_words() {
+        ensure_tmp_node_id();
         let _ = fs::remove_dir_all("/tmp/windows_dupl_server_d");
         let mut custom_stop_dict = default_stop_dict();
         custom_stop_dict.push("javascript".to_owned());
@@ -900,7 +915,8 @@ mod test {
         let mut app = entrypoint("ipc:///tmp/dupl_server_d".to_owned(),
                                  "/tmp/windows_dupl_server_d".to_owned(),
                                  "/tmp/dupl_server_d.key".to_owned(),
-                                 None, None, None, None, None, None, None, None, None, None, None, custom_stop_dict).unwrap();
+                                 Some("/tmp/node.id".to_owned()),
+                                 None, None, None, None, None, None, None, None, None, None, custom_stop_dict).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_d").unwrap();
 
@@ -968,11 +984,13 @@ mod test {
 
     #[test]
     fn insert_cluster_best_sim() {
+        ensure_tmp_node_id();
         let _ = fs::remove_dir_all("/tmp/windows_dupl_server_e");
         let mut app = entrypoint("ipc:///tmp/dupl_server_e".to_owned(),
                                  "/tmp/windows_dupl_server_e".to_owned(),
                                  "/tmp/dupl_server_e.key".to_owned(),
-                                 None, None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
+                                 Some("/tmp/node.id".to_owned()),
+                                 None, None, None, None, None, None, None, None, None, None, default_stop_dict()).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_e").unwrap();
         // try to add something
