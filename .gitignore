@@ -2,3 +2,7 @@ target
 Cargo.lock
 *~
 windows
+windows.tar.gz
+stdout.log
+stderr.log
+dupl-server.pid
