@@ -18,6 +18,7 @@ use std::sync::mpsc::{channel, sync_channel, Sender, Receiver, TryRecvError};
 use clap::Arg;
 use serde::{Serialize, Serializer, Deserialize, Deserializer};
 use yauid::Yauid;
+use bin_merge_pile::ntree_bkd::mmap;
 use bin_merge_pile::merge::ParallelConfig;
 use hash_dupl::{HashDupl, Config, Shingles, Backend};
 use hash_dupl::shingler::tokens::Tokens;
@@ -172,6 +173,14 @@ fn bootstrap(matches: &clap::ArgMatches) -> Result<(), Error> {
     let redirect_stdout = matches.value_of("redirect-stdout");
     let redirect_stderr = matches.value_of("redirect-stderr");
     let pid_file = matches.value_of("pid-file");
+    let mmap_mode = match matches.value_of("mmap-type") {
+        Some("mmap") =>
+            mmap::MmapType::TrueMmap { madv_willneed: matches.is_present("madvise-willneed"), },
+        Some("malloc") =>
+            mmap::MmapType::Malloc,
+        _ =>
+            unreachable!(),
+    };
 
     if daemonize {
         let pid = try!(daemonize_redirect(redirect_stdout, redirect_stderr, ChdirMode::NoChdir).map_err(|e| Error::Daemonize(e)));
@@ -198,7 +207,8 @@ fn bootstrap(matches: &clap::ArgMatches) -> Result<(), Error> {
                     shingle_length,
                     similarity_threshold,
                     band_min_probability,
-                    stop_words)).join();
+                    stop_words,
+                    mmap_mode)).join();
     println!("Server terminated");
     Ok(())
 }
@@ -217,7 +227,8 @@ pub fn entrypoint(external_zmq_addr: &str,
                   shingle_length: Option<usize>,
                   similarity_threshold: Option<f64>,
                   band_min_probability: Option<f64>,
-                  stop_words: Vec<String>) -> Result<App, Error>
+                  stop_words: Vec<String>,
+                  mmap_mode: mmap::MmapType) -> Result<App, Error>
 {
     let mut zmq_ctx = zmq::Context::new();
     let mut ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -257,7 +268,8 @@ pub fn entrypoint(external_zmq_addr: &str,
                    shingle_length,
                    similarity_threshold,
                    band_min_probability,
-                   stop_words).unwrap();
+                   stop_words,
+                   mmap_mode).unwrap();
         slave_watchdog_tx.send(()).unwrap();
     }).unwrap();
 
@@ -564,7 +576,8 @@ fn slave_loop(database_dir: String,
               shingle_length: Option<usize>,
               similarity_threshold: Option<f64>,
               band_min_probability: Option<f64>,
-              stop_words: Vec<String>) -> Result<(), Error>
+              stop_words: Vec<String>,
+              mmap_mode: mmap::MmapType) -> Result<(), Error>
 {
     let mut config: Config = Default::default();
     signature_length.map(|v| config.signature_length = v);
@@ -576,6 +589,7 @@ fn slave_loop(database_dir: String,
     min_tree_height.map(|v| params.compile_params.min_tree_height = v);
     max_block_size.map(|v| params.compile_params.max_block_size = v);
     mem_limit_power.map(|v| params.compile_params.memory_limit_power = v);
+    params.lookup_params.mmap_type = mmap_mode;
     merge_pile_threads.map(|v| if v == 1 {
         params.compile_params.parallel_config = ParallelConfig::SingleThread
     } else if v > 1 {
@@ -618,57 +632,23 @@ fn main() {
         .author("Alexey Voznyuk <me@swizard.info>")
         .about("High performance documents stream clustering server.")
         .arg(Arg::with_name("zmq-addr")
+             .display_order(1)
              .short("z")
              .long("zmq-addr")
              .value_name("ADDR")
              .help("Server zeromq listen address.")
              .takes_value(true)
              .default_value("ipc://./dupl_server.ipc"))
-        .arg(Arg::with_name("key-file")
-             .short("k")
-             .long("key-file")
-             .value_name("FILE")
-             .help("Yauid key file to use.")
-             .takes_value(true)
-             .default_value("/tmp/hbase.key"))
-        .arg(Arg::with_name("node-id")
-             .short("n")
-             .long("node-id")
-             .value_name("FILE")
-             .help("Yauid node id file to use if no \"/etc/node.id\" found.")
-             .takes_value(true))
         .arg(Arg::with_name("database")
+             .display_order(2)
              .short("d")
              .long("database")
              .value_name("PATH")
              .help("Database path for a backend.")
              .takes_value(true)
              .default_value("./windows"))
-        .arg(Arg::with_name("min-tree-height")
-             .long("min-tree-height")
-             .value_name("VALUE")
-             .help("Minimum tree height for NTree index.")
-             .takes_value(true)
-             .default_value("3"))
-        .arg(Arg::with_name("max-block-size")
-             .long("max-block-size")
-             .value_name("VALUE")
-             .help("Maximum block size for NTree index.")
-             .takes_value(true)
-             .default_value("64"))
-        .arg(Arg::with_name("mem-limit-power")
-             .long("mem-limit-power")
-             .value_name("VALUE")
-             .help("Power limit for memory part of bin-merge-pile index compiler.")
-             .takes_value(true)
-             .default_value("16"))
-        .arg(Arg::with_name("merge-pile-threads")
-             .long("merge-pile-threads")
-             .value_name("COUNT")
-             .help("Number of threads for bin-merge-pile index compiler.")
-             .takes_value(true)
-             .default_value("1"))
         .arg(Arg::with_name("windows-count")
+             .display_order(3)
              .short("w")
              .long("windows-count")
              .value_name("COUNT")
@@ -676,53 +656,118 @@ fn main() {
              .takes_value(true)
              .default_value("32"))
         .arg(Arg::with_name("rotate-count")
+             .display_order(4)
              .short("r")
              .long("rotate-count")
              .value_name("COUNT")
              .help("Windows rotate for stream backend for each 'count' documents inserted.")
              .takes_value(true)
              .default_value("32768"))
+        .arg(Arg::with_name("key-file")
+             .display_order(5)
+             .short("k")
+             .long("key-file")
+             .value_name("FILE")
+             .help("Yauid key file to use.")
+             .takes_value(true)
+             .default_value("/tmp/hbase.key"))
+        .arg(Arg::with_name("node-id")
+             .display_order(6)
+             .short("n")
+             .long("node-id")
+             .value_name("FILE")
+             .help("Yauid node id file to use if no \"/etc/node.id\" found.")
+             .takes_value(true))
+        .arg(Arg::with_name("min-tree-height")
+             .display_order(7)
+             .long("min-tree-height")
+             .value_name("VALUE")
+             .help("Minimum tree height for NTree index.")
+             .takes_value(true)
+             .default_value("3"))
+        .arg(Arg::with_name("max-block-size")
+             .display_order(8)
+             .long("max-block-size")
+             .value_name("VALUE")
+             .help("Maximum block size for NTree index.")
+             .takes_value(true)
+             .default_value("64"))
+        .arg(Arg::with_name("mem-limit-power")
+             .display_order(9)
+             .long("mem-limit-power")
+             .value_name("VALUE")
+             .help("Power limit for memory part of bin-merge-pile index compiler.")
+             .takes_value(true)
+             .default_value("16"))
+        .arg(Arg::with_name("merge-pile-threads")
+             .display_order(10)
+             .long("merge-pile-threads")
+             .value_name("COUNT")
+             .help("Number of threads for bin-merge-pile index compiler.")
+             .takes_value(true)
+             .default_value("1"))
+        .arg(Arg::with_name("mmap-type")
+             .display_order(11)
+             .long("mmap-type")
+             .value_name("TYPE")
+             .possible_values(&["mmap", "malloc"])
+             .help("Mmap type for RO windows.")
+             .takes_value(true)
+             .default_value("mmap"))
+        .arg(Arg::with_name("madvise-willneed")
+             .display_order(12)
+             .long("madvise-willneed")
+             .help("Set WILLNEED madvise(2) flag for mmap area."))
         .arg(Arg::with_name("signature-length")
+             .display_order(13)
              .long("signature-length")
              .value_name("LENGTH")
              .help("Signature length hd param to use.")
              .takes_value(true))
         .arg(Arg::with_name("shingle-length")
+             .display_order(14)
              .long("shingle-length")
              .value_name("LENGTH")
              .help("Shingle length hd param to use.")
              .takes_value(true))
         .arg(Arg::with_name("similarity-threshold")
+             .display_order(15)
              .long("similarity-threshold")
              .value_name("VALUE")
              .help("Similarity threshold hd param to use.")
              .takes_value(true))
         .arg(Arg::with_name("band-min-probability")
+             .display_order(16)
              .long("band-min-probability")
              .value_name("VALUE")
              .help("Band minimum probability hd param to use.")
              .takes_value(true))
         .arg(Arg::with_name("stop-dict")
+             .display_order(17)
              .short("s")
              .long("stop-dict")
              .value_name("FILE")
              .help("Stop words file (replaces default if provided).")
              .takes_value(true))
         .arg(Arg::with_name("daemonize")
+             .display_order(18)
              .long("daemonize")
              .help("Daemonize server."))
         .arg(Arg::with_name("redirect-stderr")
+             .display_order(19)
              .long("redirect-stderr")
              .value_name("FILE")
              .help("Redirect stderr to given file when daemonize.")
              .takes_value(true)
              .default_value("/dev/null"))
         .arg(Arg::with_name("pid-file")
+             .display_order(20)
              .long("pid-file")
              .value_name("FILE")
              .help("Save pid of the process into this file.")
              .takes_value(true))
         .arg(Arg::with_name("sd")
+             .display_order(21)
              .multiple(true)
              .long("sd")
              .value_name("WORD")
