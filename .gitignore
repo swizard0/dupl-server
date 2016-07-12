@@ -6,3 +6,5 @@ windows.tar.gz
 stdout.log
 stderr.log
 dupl-server.pid
+stop_words.txt
+node.id
