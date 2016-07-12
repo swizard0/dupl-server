@@ -1,22 +1,21 @@
 extern crate zmq;
 extern crate serde;
-extern crate getopts;
 extern crate yauid;
 extern crate hash_dupl;
 extern crate simple_signal;
 extern crate unix_daemonize;
 extern crate bin_merge_pile;
 extern crate dupl_server_proto;
+#[macro_use] extern crate clap;
 #[cfg(test)] extern crate rand;
 
-use std::{io, fs, env, process};
+use std::{io, fs, process};
 use std::io::{Write, BufRead};
 use std::sync::Arc;
 use std::convert::From;
 use std::thread::{Builder, sleep, JoinHandle};
-use std::num::{ParseFloatError, ParseIntError};
 use std::sync::mpsc::{channel, sync_channel, Sender, Receiver, TryRecvError};
-use getopts::Options;
+use clap::Arg;
 use serde::{Serialize, Serializer, Deserialize, Deserializer};
 use yauid::Yauid;
 use bin_merge_pile::merge::ParallelConfig;
@@ -49,17 +48,7 @@ pub enum ZmqError {
 
 #[derive(Debug)]
 pub enum Error {
-    Getopts(getopts::Fail),
-    InvalidSignatureLength(ParseIntError),
-    InvalidSimilarityThreshold(ParseFloatError),
-    InvalidShingleLength(ParseIntError),
-    InvalidBandMinProbability(ParseFloatError),
-    InvalidRotateCount(ParseIntError),
-    InvalidMinTreeHeight(ParseIntError),
-    InvalidMaxBlockSize(ParseIntError),
-    InvalidMemLimitPower(ParseIntError),
-    InvalidMergePileThreads(ParseIntError),
-    InvalidWindowsCount(ParseIntError),
+    Clap(clap::Error),
     NoNodeIdFileProvided,
     OpenStopDict(String, io::Error),
     ReadStopDict(String, io::Error),
@@ -121,24 +110,22 @@ impl App {
     }
 }
 
-macro_rules! try_param_parse {
-    ($matches:ident, $name:expr, $err:ident) => ({
-        try!($matches.opt_str($name).map(|s| Ok(Some(try!(s.parse())))).unwrap_or(Ok(None)).map_err(|e| Error::$err(e)))
-    })
-}
-
 pub fn default_stop_dict() -> Vec<String> {
     let words = ["or", "and", ".", "...", ",", "?", "!", "…", "\"", "http", "://", "-", "t", "co", ":", "/"];
     words.iter().map(|&w| w.to_owned()).collect()
 }
 
-fn make_stop_dict(maybe_filename: Option<String>, additional_words: Vec<String>) -> Result<Vec<String>, Error> {
-    let mut dict = if additional_words.is_empty() { default_stop_dict() } else { additional_words };
+fn make_stop_dict(maybe_filename: Option<&str>, additional_words: Option<clap::Values>) -> Result<Vec<String>, Error> {
+    let mut dict: Vec<_> = if let Some(words) = additional_words {
+        words.map(|s| s.to_string()).collect()
+    } else {
+        default_stop_dict()
+    };
     if let Some(filename) = maybe_filename {
-        let fd = try!(fs::File::open(&filename).map_err(|e| Error::OpenStopDict(filename.clone(), e)));
+        let fd = try!(fs::File::open(&filename).map_err(|e| Error::OpenStopDict(filename.to_string(), e)));
         let reader = io::BufReader::new(fd);
         for maybe_line in reader.lines() {
-            let line = try!(maybe_line.map_err(|e| Error::ReadStopDict(filename.clone(), e)));
+            let line = try!(maybe_line.map_err(|e| Error::ReadStopDict(filename.to_string(), e)));
             let trimmed_line = line.trim_matches(|c: char| c.is_whitespace() || c == '.');
             if trimmed_line.is_empty() || trimmed_line.starts_with("//") {
                 continue;
@@ -149,34 +136,49 @@ fn make_stop_dict(maybe_filename: Option<String>, additional_words: Vec<String>)
     Ok(dict)
 }
 
-fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
-    let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
-    let external_zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./dupl_server.ipc".to_owned());
-    let database_dir = matches.opt_str("database").unwrap_or("windows".to_owned());
-    let key_file = matches.opt_str("key-file").unwrap_or("/tmp/hbase.key".to_owned());
-    let node_id = matches.opt_str("node-id");
-    let min_tree_height = try_param_parse!(matches, "min-tree-height", InvalidMinTreeHeight);
-    let max_block_size = try_param_parse!(matches, "max-block-size", InvalidMaxBlockSize);
-    let mem_limit_power = try_param_parse!(matches, "mem-limit-power", InvalidMemLimitPower);
-    let merge_pile_threads = try_param_parse!(matches, "merge-pile-threads", InvalidMergePileThreads);
-    let windows_count = try_param_parse!(matches, "windows-count", InvalidWindowsCount);
-    let rotate_count = try_param_parse!(matches, "rotate-count", InvalidRotateCount);
-    let signature_length = try_param_parse!(matches, "signature-length", InvalidSignatureLength);
-    let shingle_length = try_param_parse!(matches, "shingle-length", InvalidShingleLength);
-    let similarity_threshold = try_param_parse!(matches, "similarity-threshold", InvalidSimilarityThreshold);
-    let band_min_probability = try_param_parse!(matches, "band-min-probability", InvalidBandMinProbability);
-    let stop_words = try!(make_stop_dict(matches.opt_str("stop-dict"), matches.opt_strs("sd")));
-    let daemonize = matches.opt_present("daemonize");
-    let redirect_stdout = matches.opt_str("redirect-stdout");
-    let redirect_stderr = matches.opt_str("redirect-stderr");
-    let pid_file = matches.opt_str("pid-file");
+fn param_usize(matches: &clap::ArgMatches, param: &str) -> Result<Option<usize>, Error> {
+    if matches.value_of(param).is_some() {
+        Ok(Some(try!(value_t!(matches, param, usize).map_err(Error::Clap))))
+    } else {
+        Ok(None)
+    }
+}
+
+fn param_f64(matches: &clap::ArgMatches, param: &str) -> Result<Option<f64>, Error> {
+    if matches.value_of(param).is_some() {
+        Ok(Some(try!(value_t!(matches, param, f64).map_err(Error::Clap))))
+    } else {
+        Ok(None)
+    }
+}
+
+fn bootstrap(matches: &clap::ArgMatches) -> Result<(), Error> {
+    let external_zmq_addr = matches.value_of("zmq-addr").unwrap();
+    let database_dir = matches.value_of("database").unwrap();
+    let key_file = matches.value_of("key-file").unwrap();
+    let node_id = matches.value_of("node-id");
+    let min_tree_height = try!(param_usize(matches, "min-tree-height"));
+    let max_block_size = try!(param_usize(matches, "max-block-size"));
+    let mem_limit_power = try!(param_usize(matches, "mem-limit-power"));
+    let merge_pile_threads = try!(param_usize(matches, "merge-pile-threads"));
+    let windows_count = try!(param_usize(matches, "windows-count"));
+    let rotate_count = try!(param_usize(matches, "rotate-count"));
+    let signature_length = try!(param_usize(matches, "signature-length"));
+    let shingle_length = try!(param_usize(matches, "shingle-length"));
+    let similarity_threshold = try!(param_f64(matches, "similarity-threshold"));
+    let band_min_probability = try!(param_f64(matches, "band-min-probability"));
+    let stop_words = try!(make_stop_dict(matches.value_of("stop-dict"), matches.values_of("sd")));
+    let daemonize = matches.is_present("daemonize");
+    let redirect_stdout = matches.value_of("redirect-stdout");
+    let redirect_stderr = matches.value_of("redirect-stderr");
+    let pid_file = matches.value_of("pid-file");
 
     if daemonize {
         let pid = try!(daemonize_redirect(redirect_stdout, redirect_stderr, ChdirMode::NoChdir).map_err(|e| Error::Daemonize(e)));
         println!("Daemonized with pid = {:?}", pid);
         if let Some(file) = pid_file {
-            let mut fd = try!(fs::File::create(&file).map_err(|e| Error::CreatePidFile(file.clone(), e)));
-            try!(write!(&mut fd, "{}", pid).map_err(|e| Error::WritePidFile(file.clone(), e)));
+            let mut fd = try!(fs::File::create(&file).map_err(|e| Error::CreatePidFile(file.to_string(), e)));
+            try!(write!(&mut fd, "{}", pid).map_err(|e| Error::WritePidFile(file.to_string(), e)));
         }
     }
 
@@ -201,10 +203,10 @@ fn bootstrap(maybe_matches: getopts::Result) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn entrypoint(external_zmq_addr: String,
-                  database_dir: String,
-                  key_file: String,
-                  node_id: Option<String>,
+pub fn entrypoint(external_zmq_addr: &str,
+                  database_dir_str: &str,
+                  key_file_str: &str,
+                  node_id_str: Option<&str>,
                   min_tree_height: Option<usize>,
                   max_block_size: Option<usize>,
                   mem_limit_power: Option<usize>,
@@ -221,7 +223,7 @@ pub fn entrypoint(external_zmq_addr: String,
     let mut ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
     let mut int_sock_master = try!(zmq_ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
     let mut int_sock_slave = try!(zmq_ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    try!(ext_sock.bind(&external_zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(external_zmq_addr, e))));
+    try!(ext_sock.bind(external_zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(external_zmq_addr.to_string(), e))));
     try!(int_sock_master.bind(INTERNAL_SOCKET_ADDR).map_err(|e| Error::Zmq(ZmqError::Bind(INTERNAL_SOCKET_ADDR.to_string(), e))));
     try!(int_sock_slave.connect(INTERNAL_SOCKET_ADDR).map_err(|e| Error::Zmq(ZmqError::Connect(INTERNAL_SOCKET_ADDR.to_string(), e))));
 
@@ -235,6 +237,9 @@ pub fn entrypoint(external_zmq_addr: String,
         master_watchdog_tx.send(()).unwrap();
     }).unwrap();
 
+    let database_dir = database_dir_str.to_string();
+    let key_file = key_file_str.to_string();
+    let node_id = node_id_str.map(|s| s.to_string());
     let slave_thread = Builder::new().name("slave thread".to_owned()).spawn(move || {
         slave_loop(database_dir,
                    int_sock_slave,
@@ -608,38 +613,134 @@ fn slave_loop(database_dir: String,
 }
 
 fn main() {
-    let mut args = env::args();
-    let cmd_proc = args.next().unwrap();
-    let mut opts = Options::new();
+    let matches = clap::App::new("dupl-server")
+        .version(crate_version!())
+        .author("Alexey Voznyuk <me@swizard.info>")
+        .about("High performance documents stream clustering server.")
+        .arg(Arg::with_name("zmq-addr")
+             .short("z")
+             .long("zmq-addr")
+             .value_name("ADDR")
+             .help("Server zeromq listen address.")
+             .takes_value(true)
+             .default_value("ipc://./dupl_server.ipc"))
+        .arg(Arg::with_name("key-file")
+             .short("k")
+             .long("key-file")
+             .value_name("FILE")
+             .help("Yauid key file to use.")
+             .takes_value(true)
+             .default_value("/tmp/hbase.key"))
+        .arg(Arg::with_name("node-id")
+             .short("n")
+             .long("node-id")
+             .value_name("FILE")
+             .help("Yauid node id file to use if no \"/etc/node.id\" found.")
+             .takes_value(true))
+        .arg(Arg::with_name("database")
+             .short("d")
+             .long("database")
+             .value_name("PATH")
+             .help("Database path for a backend.")
+             .takes_value(true)
+             .default_value("./windows"))
+        .arg(Arg::with_name("min-tree-height")
+             .long("min-tree-height")
+             .value_name("VALUE")
+             .help("Minimum tree height for NTree index.")
+             .takes_value(true)
+             .default_value("3"))
+        .arg(Arg::with_name("max-block-size")
+             .long("max-block-size")
+             .value_name("VALUE")
+             .help("Maximum block size for NTree index.")
+             .takes_value(true)
+             .default_value("64"))
+        .arg(Arg::with_name("mem-limit-power")
+             .long("mem-limit-power")
+             .value_name("VALUE")
+             .help("Power limit for memory part of bin-merge-pile index compiler.")
+             .takes_value(true)
+             .default_value("16"))
+        .arg(Arg::with_name("merge-pile-threads")
+             .long("merge-pile-threads")
+             .value_name("COUNT")
+             .help("Number of threads for bin-merge-pile index compiler.")
+             .takes_value(true)
+             .default_value("1"))
+        .arg(Arg::with_name("windows-count")
+             .short("w")
+             .long("windows-count")
+             .value_name("COUNT")
+             .help("Windows count for stream backend.")
+             .takes_value(true)
+             .default_value("32"))
+        .arg(Arg::with_name("rotate-count")
+             .short("r")
+             .long("rotate-count")
+             .value_name("COUNT")
+             .help("Windows rotate for stream backend for each 'count' documents inserted.")
+             .takes_value(true)
+             .default_value("32768"))
+        .arg(Arg::with_name("signature-length")
+             .long("signature-length")
+             .value_name("LENGTH")
+             .help("Signature length hd param to use.")
+             .takes_value(true))
+        .arg(Arg::with_name("shingle-length")
+             .long("shingle-length")
+             .value_name("LENGTH")
+             .help("Shingle length hd param to use.")
+             .takes_value(true))
+        .arg(Arg::with_name("similarity-threshold")
+             .long("similarity-threshold")
+             .value_name("VALUE")
+             .help("Similarity threshold hd param to use.")
+             .takes_value(true))
+        .arg(Arg::with_name("band-min-probability")
+             .long("band-min-probability")
+             .value_name("VALUE")
+             .help("Band minimum probability hd param to use.")
+             .takes_value(true))
+        .arg(Arg::with_name("stop-dict")
+             .short("s")
+             .long("stop-dict")
+             .value_name("FILE")
+             .help("Stop words file (replaces default if provided).")
+             .takes_value(true))
+        .arg(Arg::with_name("daemonize")
+             .long("daemonize")
+             .help("Daemonize server."))
+        .arg(Arg::with_name("redirect-stderr")
+             .long("redirect-stderr")
+             .value_name("FILE")
+             .help("Redirect stderr to given file when daemonize.")
+             .takes_value(true)
+             .default_value("/dev/null"))
+        .arg(Arg::with_name("pid-file")
+             .long("pid-file")
+             .value_name("FILE")
+             .help("Save pid of the process into this file.")
+             .takes_value(true))
+        .arg(Arg::with_name("sd")
+             .multiple(true)
+             .long("sd")
+             .value_name("WORD")
+             .help("Additional stop word for hash-dupl.")
+             .takes_value(true))
+        .get_matches();
 
-    opts.optopt("z", "zmq-addr", "server zeromq listen address (optional, default: ipc://./dupl_server.ipc)", "");
-    opts.optopt("k", "key-file", "yauid key file to use (optional, default: /tmp/hbase.key)", "");
-    opts.optopt("n", "node-id", " yauid node id file to use if no /etc/node.id found (optional, default: /etc/node.id)", "");
-    opts.optopt("d", "database", "database path for a backend (optional, default: ./windows)", "");
-    opts.optopt("", "min-tree-height", "minimum tree height for NTree index (optional, default: 3)", "");
-    opts.optopt("", "max-block-size", "maximum block size for NTree index (optional, default: 64)", "");
-    opts.optopt("", "mem-limit-power", "power limit for memory part of bin-merge-pile index compiler (optional, default: 16)", "");
-    opts.optopt("", "merge-pile-threads", "number of threads for bin-merge-pile index compiler (optional, default: 1)", "");
-    opts.optopt("w", "windows-count", "windows count for stream backend (optional, default: 32)", "");
-    opts.optopt("r", "rotate-count", "windows rotate for stream backend for each 'count' documents inserted (optional, default: 32768)", "");
-    opts.optopt("", "signature-length", "signature length hd param to use (optional)", "");
-    opts.optopt("", "shingle-length", "shingle length hd param to use (optional)", "");
-    opts.optopt("", "similarity-threshold", "similarity threshold hd param to use (optional)", "");
-    opts.optopt("", "band-min-probability", "band minimum probability hd param to use (optional)", "");
-    opts.optopt("s", "stop-dict", "stop words file (optional, replaces default)", "");
-    opts.optflag("", "daemonize", "daemonize server (optional, default: no daemonize)");
-    opts.optopt("", "redirect-stdout", "redirect stdout to given file when daemonize (optional, default: /dev/null)", "");
-    opts.optopt("", "redirect-stderr", "redirect stderr to given file when daemonize (optional, default: /dev/null)", "");
-    opts.optopt("", "pid-file", "save pid of the process into this file (optional, default: no save)", "");
-    opts.optmulti("", "sd", "additional stop word for hash-dupl (optional, may be provided several times)", "");
-
-    match bootstrap(opts.parse(args)) {
+    match bootstrap(&matches) {
         Ok(()) =>
             (),
         Err(cause) => {
-            let _ = writeln!(&mut io::stderr(), "Error: {:?}", cause);
-            let usage = format!("Usage: {}", cmd_proc);
-            let _ = writeln!(&mut io::stderr(), "{}", opts.usage(&usage[..]));
+            let _ = match cause {
+                Error::Clap(ce) =>
+                    writeln!(&mut io::stderr(), "{}", ce),
+                other =>
+                    writeln!(&mut io::stderr(), "An error occurred:\n{:?}", other),
+            };
+            let _ = writeln!(&mut io::stderr(), "{}", matches.usage());
             process::exit(1);
         }
     }
