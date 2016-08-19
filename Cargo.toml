@@ -1,13 +1,13 @@
 [package]
 name = "dupl-server"
 description = "High performance documents stream clustering server."
-version = "0.7.1"
+version = "0.7.2"
 license = "MIT"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
 clap = "2.9"
-serde = "0.7"
+serde = "0.8"
 simple-signal = "1.0"
 unix-daemonize = "0.1"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
