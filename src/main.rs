@@ -230,10 +230,10 @@ pub fn entrypoint(external_zmq_addr: &str,
                   stop_words: Vec<String>,
                   mmap_mode: mmap::MmapType) -> Result<App, Error>
 {
-    let mut zmq_ctx = zmq::Context::new();
-    let mut ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    let mut int_sock_master = try!(zmq_ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    let mut int_sock_slave = try!(zmq_ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let zmq_ctx = zmq::Context::new();
+    let ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let int_sock_master = try!(zmq_ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let int_sock_slave = try!(zmq_ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
     try!(ext_sock.bind(external_zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(external_zmq_addr.to_string(), e))));
     try!(int_sock_master.bind(INTERNAL_SOCKET_ADDR).map_err(|e| Error::Zmq(ZmqError::Bind(INTERNAL_SOCKET_ADDR.to_string(), e))));
     try!(int_sock_slave.connect(INTERNAL_SOCKET_ADDR).map_err(|e| Error::Zmq(ZmqError::Connect(INTERNAL_SOCKET_ADDR.to_string(), e))));
@@ -288,7 +288,7 @@ pub struct Message<R> {
     pub load: R,
 }
 
-fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Trans<Arc<String>>), Error> {
+fn rx_sock(sock: &zmq::Socket) -> Result<(Option<Headers>, Trans<Arc<String>>), Error> {
     let mut frames = Vec::new();
     loop {
         frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
@@ -301,21 +301,21 @@ fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Trans<Arc<String>
     Ok((Some(frames), try!(Trans::decode(&load_msg)).0))
 }
 
-fn tx_sock(packet: Rep<Arc<String>>, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
+fn tx_sock(packet: Rep<Arc<String>>, maybe_headers: Option<Headers>, sock: &zmq::Socket) -> Result<(), Error> {
     let required = packet.encode_len();
-    let mut load_msg = try!(zmq::Message::with_capacity(required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
+    let mut load_msg = zmq::Message::with_capacity(required);
     packet.encode(&mut load_msg);
 
     if let Some(headers) = maybe_headers {
         for header in headers {
-            try!(sock.send_msg(header, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+            try!(sock.send(header, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
         }
     }
-    sock.send_msg(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
+    sock.send(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
 }
 
-fn master_loop(mut ext_sock: zmq::Socket,
-               mut int_sock: zmq::Socket,
+fn master_loop(ext_sock: zmq::Socket,
+               int_sock: zmq::Socket,
                tx: Sender<Message<Req<Arc<String>>>>,
                rx: Receiver<Message<Rep<Arc<String>>>>) -> Result<(), Error>
 {
@@ -344,10 +344,10 @@ fn master_loop(mut ext_sock: zmq::Socket,
                     match message.load {
                         rep @ Rep::TerminateAck => {
                             slave_state = SlaveState::Finished;
-                            try!(tx_sock(rep, message.headers, &mut ext_sock));
+                            try!(tx_sock(rep, message.headers, &ext_sock));
                         },
                         rep =>
-                            try!(tx_sock(rep, message.headers, &mut ext_sock)),
+                            try!(tx_sock(rep, message.headers, &ext_sock)),
                     }
                 },
                 Err(TryRecvError::Empty) =>
@@ -362,7 +362,7 @@ fn master_loop(mut ext_sock: zmq::Socket,
         }
 
         if ext_sock_online {
-            req_queue.push(try!(rx_sock(&mut ext_sock)))
+            req_queue.push(try!(rx_sock(&ext_sock)))
         }
 
         let mut req_queue_skipped = Vec::new();
@@ -377,7 +377,7 @@ fn master_loop(mut ext_sock: zmq::Socket,
                     slave_state = SlaveState::Busy;
                 },
                 ((headers, Trans::Async(..)), &SlaveState::Busy) =>
-                    try!(tx_sock(Rep::TooBusy, headers, &mut ext_sock)),
+                    try!(tx_sock(Rep::TooBusy, headers, &ext_sock)),
                 ((headers, trans @ Trans::Sync(..)), &SlaveState::Busy) =>
                     req_queue_skipped.push((headers, trans)),
                 (_, &SlaveState::Finished) =>
@@ -389,7 +389,7 @@ fn master_loop(mut ext_sock: zmq::Socket,
 }
 
 fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
-    sock.send_msg(try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 0)
+    sock.send(zmq::Message::new(), 0)
         .map_err(|e| Error::Zmq(ZmqError::Send(e)))
 }
 
@@ -805,9 +805,9 @@ mod test {
 
     fn tx_sock(packet: Trans<String>, sock: &mut zmq::Socket) {
         let required = packet.encode_len();
-        let mut msg = zmq::Message::with_capacity(required).unwrap();
+        let mut msg = zmq::Message::with_capacity(required);
         packet.encode(&mut msg);
-        sock.send_msg(msg, 0).unwrap();
+        sock.send(msg, 0).unwrap();
     }
 
     fn rx_sock(sock: &mut zmq::Socket) -> Rep<String> {
