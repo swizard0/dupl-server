@@ -406,19 +406,15 @@ struct HashDuplEntry {
 }
 
 impl Serialize for HashDuplEntry {
-    fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error> where S: Serializer {
-        try!(self.cluster_id.serialize(serializer));
-        try!(self.user_data.serialize(serializer));
-        Ok(())
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
+        (self.cluster_id, &*self.user_data).serialize(serializer)
     }
 }
 
-impl Deserialize for HashDuplEntry {
-    fn deserialize<D>(deserializer: &mut D) -> Result<HashDuplEntry, D::Error> where D: Deserializer {
-        Ok(HashDuplEntry {
-            cluster_id: try!(Deserialize::deserialize(deserializer)),
-            user_data: try!(Deserialize::deserialize(deserializer)),
-        })
+impl<'a> Deserialize<'a> for HashDuplEntry {
+    fn deserialize<D>(deserializer: D) -> Result<HashDuplEntry, D::Error> where D: Deserializer<'a> {
+        let (cluster_id, user_data) = try!(Deserialize::deserialize(deserializer));
+        Ok(HashDuplEntry { cluster_id, user_data: Arc::new(user_data), })
     }
 }
 
