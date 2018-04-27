@@ -123,10 +123,10 @@ fn make_stop_dict(maybe_filename: Option<&str>, additional_words: Option<clap::V
         default_stop_dict()
     };
     if let Some(filename) = maybe_filename {
-        let fd = try!(fs::File::open(&filename).map_err(|e| Error::OpenStopDict(filename.to_string(), e)));
+        let fd = fs::File::open(&filename).map_err(|e| Error::OpenStopDict(filename.to_string(), e))?;
         let reader = io::BufReader::new(fd);
         for maybe_line in reader.lines() {
-            let line = try!(maybe_line.map_err(|e| Error::ReadStopDict(filename.to_string(), e)));
+            let line = maybe_line.map_err(|e| Error::ReadStopDict(filename.to_string(), e))?;
             let trimmed_line = line.trim_matches(|c: char| c.is_whitespace() || c == '.');
             if trimmed_line.is_empty() || trimmed_line.starts_with("//") {
                 continue;
@@ -139,7 +139,7 @@ fn make_stop_dict(maybe_filename: Option<&str>, additional_words: Option<clap::V
 
 fn param_usize(matches: &clap::ArgMatches, param: &str) -> Result<Option<usize>, Error> {
     if matches.value_of(param).is_some() {
-        Ok(Some(try!(value_t!(matches, param, usize).map_err(Error::Clap))))
+        Ok(Some(value_t!(matches, param, usize).map_err(Error::Clap)?))
     } else {
         Ok(None)
     }
@@ -147,7 +147,7 @@ fn param_usize(matches: &clap::ArgMatches, param: &str) -> Result<Option<usize>,
 
 fn param_f64(matches: &clap::ArgMatches, param: &str) -> Result<Option<f64>, Error> {
     if matches.value_of(param).is_some() {
-        Ok(Some(try!(value_t!(matches, param, f64).map_err(Error::Clap))))
+        Ok(Some(value_t!(matches, param, f64).map_err(Error::Clap)?))
     } else {
         Ok(None)
     }
@@ -158,17 +158,17 @@ fn bootstrap(matches: &clap::ArgMatches) -> Result<(), Error> {
     let database_dir = matches.value_of("database").unwrap();
     let key_file = matches.value_of("key-file").unwrap();
     let node_id = matches.value_of("node-id");
-    let min_tree_height = try!(param_usize(matches, "min-tree-height"));
-    let max_block_size = try!(param_usize(matches, "max-block-size"));
-    let mem_limit_power = try!(param_usize(matches, "mem-limit-power"));
-    let merge_pile_threads = try!(param_usize(matches, "merge-pile-threads"));
-    let windows_count = try!(param_usize(matches, "windows-count"));
-    let rotate_count = try!(param_usize(matches, "rotate-count"));
-    let signature_length = try!(param_usize(matches, "signature-length"));
-    let shingle_length = try!(param_usize(matches, "shingle-length"));
-    let similarity_threshold = try!(param_f64(matches, "similarity-threshold"));
-    let band_min_probability = try!(param_f64(matches, "band-min-probability"));
-    let stop_words = try!(make_stop_dict(matches.value_of("stop-dict"), matches.values_of("sd")));
+    let min_tree_height = param_usize(matches, "min-tree-height")?;
+    let max_block_size = param_usize(matches, "max-block-size")?;
+    let mem_limit_power = param_usize(matches, "mem-limit-power")?;
+    let merge_pile_threads = param_usize(matches, "merge-pile-threads")?;
+    let windows_count = param_usize(matches, "windows-count")?;
+    let rotate_count = param_usize(matches, "rotate-count")?;
+    let signature_length = param_usize(matches, "signature-length")?;
+    let shingle_length = param_usize(matches, "shingle-length")?;
+    let similarity_threshold = param_f64(matches, "similarity-threshold")?;
+    let band_min_probability = param_f64(matches, "band-min-probability")?;
+    let stop_words = make_stop_dict(matches.value_of("stop-dict"), matches.values_of("sd"))?;
     let daemonize = matches.is_present("daemonize");
     let redirect_stdout = matches.value_of("redirect-stdout");
     let redirect_stderr = matches.value_of("redirect-stderr");
@@ -183,32 +183,32 @@ fn bootstrap(matches: &clap::ArgMatches) -> Result<(), Error> {
     };
 
     if daemonize {
-        let pid = try!(daemonize_redirect(redirect_stdout, redirect_stderr, ChdirMode::NoChdir).map_err(|e| Error::Daemonize(e)));
+        let pid = daemonize_redirect(redirect_stdout, redirect_stderr, ChdirMode::NoChdir).map_err(|e| Error::Daemonize(e))?;
         println!("Daemonized with pid = {:?}", pid);
         if let Some(file) = pid_file {
-            let mut fd = try!(fs::File::create(&file).map_err(|e| Error::CreatePidFile(file.to_string(), e)));
-            try!(write!(&mut fd, "{}", pid).map_err(|e| Error::WritePidFile(file.to_string(), e)));
+            let mut fd = fs::File::create(&file).map_err(|e| Error::CreatePidFile(file.to_string(), e))?;
+            write!(&mut fd, "{}", pid).map_err(|e| Error::WritePidFile(file.to_string(), e))?;
         }
     }
 
     signal::term_on_signal(&external_zmq_addr);
     println!("Server started");
-    try!(entrypoint(external_zmq_addr,
-                    database_dir,
-                    key_file,
-                    node_id,
-                    min_tree_height,
-                    max_block_size,
-                    mem_limit_power,
-                    merge_pile_threads,
-                    windows_count,
-                    rotate_count,
-                    signature_length,
-                    shingle_length,
-                    similarity_threshold,
-                    band_min_probability,
-                    stop_words,
-                    mmap_mode)).join();
+    entrypoint(external_zmq_addr,
+               database_dir,
+               key_file,
+               node_id,
+               min_tree_height,
+               max_block_size,
+               mem_limit_power,
+               merge_pile_threads,
+               windows_count,
+               rotate_count,
+               signature_length,
+               shingle_length,
+               similarity_threshold,
+               band_min_probability,
+               stop_words,
+               mmap_mode)?.join();
     println!("Server terminated");
     Ok(())
 }
@@ -231,12 +231,12 @@ pub fn entrypoint(external_zmq_addr: &str,
                   mmap_mode: mmap::MmapType) -> Result<App, Error>
 {
     let zmq_ctx = zmq::Context::new();
-    let ext_sock = try!(zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    let int_sock_master = try!(zmq_ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    let int_sock_slave = try!(zmq_ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    try!(ext_sock.bind(external_zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(external_zmq_addr.to_string(), e))));
-    try!(int_sock_master.bind(INTERNAL_SOCKET_ADDR).map_err(|e| Error::Zmq(ZmqError::Bind(INTERNAL_SOCKET_ADDR.to_string(), e))));
-    try!(int_sock_slave.connect(INTERNAL_SOCKET_ADDR).map_err(|e| Error::Zmq(ZmqError::Connect(INTERNAL_SOCKET_ADDR.to_string(), e))));
+    let ext_sock = zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e)))?;
+    let int_sock_master = zmq_ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e)))?;
+    let int_sock_slave = zmq_ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e)))?;
+    ext_sock.bind(external_zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(external_zmq_addr.to_string(), e)))?;
+    int_sock_master.bind(INTERNAL_SOCKET_ADDR).map_err(|e| Error::Zmq(ZmqError::Bind(INTERNAL_SOCKET_ADDR.to_string(), e)))?;
+    int_sock_slave.connect(INTERNAL_SOCKET_ADDR).map_err(|e| Error::Zmq(ZmqError::Connect(INTERNAL_SOCKET_ADDR.to_string(), e)))?;
 
     let (master_tx, slave_rx) = channel();
     let (slave_tx, master_rx) = channel();
@@ -291,14 +291,14 @@ pub struct Message<R> {
 fn rx_sock(sock: &zmq::Socket) -> Result<(Option<Headers>, Trans<Arc<String>>), Error> {
     let mut frames = Vec::new();
     loop {
-        frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
-        if !try!(sock.get_rcvmore().map_err(|e| Error::Zmq(ZmqError::GetSockOpt(e)))) {
+        frames.push(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))?);
+        if !sock.get_rcvmore().map_err(|e| Error::Zmq(ZmqError::GetSockOpt(e)))? {
             break
         }
     }
 
     let load_msg = frames.pop().unwrap();
-    Ok((Some(frames), try!(Trans::decode(&load_msg)).0))
+    Ok((Some(frames), Trans::decode(&load_msg)?.0))
 }
 
 fn tx_sock(packet: Rep<Arc<String>>, maybe_headers: Option<Headers>, sock: &zmq::Socket) -> Result<(), Error> {
@@ -308,7 +308,7 @@ fn tx_sock(packet: Rep<Arc<String>>, maybe_headers: Option<Headers>, sock: &zmq:
 
     if let Some(headers) = maybe_headers {
         for header in headers {
-            try!(sock.send(header, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+            sock.send(header, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e)))?;
         }
     }
     sock.send(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
@@ -325,12 +325,12 @@ fn master_loop(ext_sock: zmq::Socket,
     loop {
         let (ext_sock_online, int_sock_online) = {
             let mut pollitems = [ext_sock.as_poll_item(zmq::POLLIN), int_sock.as_poll_item(zmq::POLLIN)];
-            try!(zmq::poll(&mut pollitems, -1).map_err(|e| Error::Zmq(ZmqError::Poll(e))));
+            zmq::poll(&mut pollitems, -1).map_err(|e| Error::Zmq(ZmqError::Poll(e)))?;
             (pollitems[0].get_revents() == zmq::POLLIN, pollitems[1].get_revents() == zmq::POLLIN)
         };
 
         if int_sock_online {
-            let _ = try!(int_sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
+            let _ = int_sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))?;
         }
 
         loop {
@@ -344,10 +344,10 @@ fn master_loop(ext_sock: zmq::Socket,
                     match message.load {
                         rep @ Rep::TerminateAck => {
                             slave_state = SlaveState::Finished;
-                            try!(tx_sock(rep, message.headers, &ext_sock));
+                            tx_sock(rep, message.headers, &ext_sock)?;
                         },
                         rep =>
-                            try!(tx_sock(rep, message.headers, &ext_sock)),
+                            tx_sock(rep, message.headers, &ext_sock)?,
                     }
                 },
                 Err(TryRecvError::Empty) =>
@@ -362,7 +362,7 @@ fn master_loop(ext_sock: zmq::Socket,
         }
 
         if ext_sock_online {
-            req_queue.push(try!(rx_sock(&ext_sock)))
+            req_queue.push(rx_sock(&ext_sock)?)
         }
 
         let mut req_queue_skipped = Vec::new();
@@ -377,7 +377,7 @@ fn master_loop(ext_sock: zmq::Socket,
                     slave_state = SlaveState::Busy;
                 },
                 ((headers, Trans::Async(..)), &SlaveState::Busy) =>
-                    try!(tx_sock(Rep::TooBusy, headers, &ext_sock)),
+                    tx_sock(Rep::TooBusy, headers, &ext_sock)?,
                 ((headers, trans @ Trans::Sync(..)), &SlaveState::Busy) =>
                     req_queue_skipped.push((headers, trans)),
                 (_, &SlaveState::Finished) =>
@@ -413,7 +413,7 @@ impl Serialize for HashDuplEntry {
 
 impl<'a> Deserialize<'a> for HashDuplEntry {
     fn deserialize<D>(deserializer: D) -> Result<HashDuplEntry, D::Error> where D: Deserializer<'a> {
-        let (cluster_id, user_data) = try!(Deserialize::deserialize(deserializer));
+        let (cluster_id, user_data) = Deserialize::deserialize(deserializer)?;
         Ok(HashDuplEntry { cluster_id, user_data: Arc::new(user_data), })
     }
 }
@@ -443,10 +443,10 @@ impl Processor {
             return Err(Error::NoNodeIdFileProvided)
         };
 
-        let yauid = try!(Yauid::with_node_id(&key_file, node_file));
-        let backend = try!(Stream::new(database_dir, params).map_err(|e| hash_dupl::Error::Backend(e)));
+        let yauid = Yauid::with_node_id(&key_file, node_file)?;
+        let backend = Stream::new(database_dir, params).map_err(|e| hash_dupl::Error::Backend(e))?;
         let mut tokenizer = Tokens::new();
-        try!(tokenizer.set_stop_words::<_, Error>(stop_words.into_iter().map(|v| Ok(v))));
+        tokenizer.set_stop_words::<_, Error>(stop_words.into_iter().map(|v| Ok(v)))?;
         let hd = HashDupl::new(tokenizer, backend, config).unwrap();
         let shingles = Shingles::new();
 
@@ -462,12 +462,12 @@ impl Processor {
     fn handle(&mut self, LookupTask { text: doc_text, result: lookup_type, post_action: action, }: LookupTask<Arc<String>>) ->
         Result<LookupResult<Arc<String>>, Error>
     {
-        try!(self.hd.shinglify(doc_text, &mut self.shingles));
-        let signature = try!(self.hd.sign(&self.shingles));
+        self.hd.shinglify(doc_text, &mut self.shingles)?;
+        let signature = self.hd.sign(&self.shingles)?;
         let (rep, best_similarity) = match lookup_type {
             LookupType::All => {
                 let mut best_similarity = None;
-                let mut matches: Vec<_> = try!(self.hd.lookup_all(signature.clone()))
+                let mut matches: Vec<_> = self.hd.lookup_all(signature.clone())?
                     .into_iter()
                     .map(|neighbour| Match {
                         cluster_id: neighbour.document.cluster_id,
@@ -486,7 +486,7 @@ impl Processor {
                 }
             },
             LookupType::Best | LookupType::BestOrMine =>
-                match try!(self.hd.lookup_best(signature.clone())) {
+                match self.hd.lookup_best(signature.clone())? {
                     None =>
                         (LookupResult::EmptySet, None),
                     Some(neighbour) =>
@@ -526,18 +526,18 @@ impl Processor {
 
                 let assigned_cluster_id = match assign_choice {
                     Ok(ClusterChoice::ServerChoice) =>
-                        try!(self.yauid.get_key()),
+                        self.yauid.get_key()?,
                     Ok(ClusterChoice::ClientChoice(cluster_id)) =>
                         cluster_id,
                     Err(cluster_id) =>
                         cluster_id,
                 };
 
-                try!(self.hd.insert(signature, Arc::new(HashDuplEntry { cluster_id: assigned_cluster_id, user_data: action_data.clone(), })));
+                self.hd.insert(signature, Arc::new(HashDuplEntry { cluster_id: assigned_cluster_id, user_data: action_data.clone(), }))?;
 
                 self.inserts_count += 1;
                 if self.inserts_count >= self.rotate_count {
-                    try!(self.hd.backend_mut().rotate().map_err(|e| Error::HashDupl(hash_dupl::Error::Backend(e))));
+                    self.hd.backend_mut().rotate().map_err(|e| Error::HashDupl(hash_dupl::Error::Backend(e)))?;
                     self.inserts_count = 0;
                 }
 
@@ -596,25 +596,25 @@ fn slave_loop(database_dir: String,
     });
     windows_count.map(|v| params.windows_count = v);
 
-    let mut processor = try!(Processor::new(config, params, database_dir, stop_words, rotate_count, key_file, node_id));
+    let mut processor = Processor::new(config, params, database_dir, stop_words, rotate_count, key_file, node_id)?;
     loop {
         match rx.recv().unwrap() {
             Message { headers: hdrs, load: Req::Init, } =>
-                try!(rep_notify(Rep::InitAck, hdrs, &tx, &mut int_sock)),
+                rep_notify(Rep::InitAck, hdrs, &tx, &mut int_sock)?,
             Message { headers: hdrs, load: Req::Terminate, } => {
-                try!(rep_notify(Rep::TerminateAck, hdrs, &tx, &mut int_sock));
+                rep_notify(Rep::TerminateAck, hdrs, &tx, &mut int_sock)?;
                 break;
             },
             Message { headers: hdrs, load: Req::Lookup(Workload::Single(task)), } => {
                 let rep = processor.handle(task).unwrap_or_else(|e| LookupResult::Error(format!("{:?}", e)));
-                try!(rep_notify(Rep::Result(Workload::Single(rep)), hdrs, &tx, &mut int_sock));
+                rep_notify(Rep::Result(Workload::Single(rep)), hdrs, &tx, &mut int_sock)?;
             },
             Message { headers: hdrs, load: Req::Lookup(Workload::Many(tasks)), } => {
                 let reps: Vec<_> = tasks
                     .into_iter()
                     .map(|task| processor.handle(task).unwrap_or_else(|e| LookupResult::Error(format!("{:?}", e))))
                     .collect();
-                try!(rep_notify(Rep::Result(Workload::Many(reps)), hdrs, &tx, &mut int_sock));
+                rep_notify(Rep::Result(Workload::Many(reps)), hdrs, &tx, &mut int_sock)?;
             },
         }
     }
