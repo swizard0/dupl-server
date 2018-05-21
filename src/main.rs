@@ -23,6 +23,7 @@ use bin_merge_pile::merge::ParallelConfig;
 use hash_dupl::{HashDupl, Config, Shingles, Backend};
 use hash_dupl::shingler::tokens::Tokens;
 use hash_dupl::backend::stream::{Params, Stream};
+use hash_dupl::backend::pile_lookup::DataAccess;
 use unix_daemonize::{daemonize_redirect, ChdirMode};
 use dupl_server_proto as proto;
 use dupl_server_proto::{
@@ -181,6 +182,14 @@ fn bootstrap(matches: &clap::ArgMatches) -> Result<(), Error> {
         _ =>
             unreachable!(),
     };
+    let data_access = match matches.value_of("data-access") {
+        Some("file-seek") =>
+            DataAccess::FileSeek,
+        Some("memory-cache") =>
+            DataAccess::MemoryCache,
+        _ =>
+            unreachable!(),
+    };
 
     if daemonize {
         let pid = daemonize_redirect(redirect_stdout, redirect_stderr, ChdirMode::NoChdir).map_err(|e| Error::Daemonize(e))?;
@@ -208,27 +217,33 @@ fn bootstrap(matches: &clap::ArgMatches) -> Result<(), Error> {
                similarity_threshold,
                band_min_probability,
                stop_words,
-               mmap_mode)?.join();
+               mmap_mode,
+               data_access,
+    )?.join();
     println!("Server terminated");
     Ok(())
 }
 
-pub fn entrypoint(external_zmq_addr: &str,
-                  database_dir_str: &str,
-                  key_file_str: &str,
-                  node_id_str: Option<&str>,
-                  min_tree_height: Option<usize>,
-                  max_block_size: Option<usize>,
-                  mem_limit_power: Option<usize>,
-                  merge_pile_threads: Option<usize>,
-                  windows_count: Option<usize>,
-                  rotate_count: Option<usize>,
-                  signature_length: Option<usize>,
-                  shingle_length: Option<usize>,
-                  similarity_threshold: Option<f64>,
-                  band_min_probability: Option<f64>,
-                  stop_words: Vec<String>,
-                  mmap_mode: mmap::MmapType) -> Result<App, Error>
+pub fn entrypoint(
+    external_zmq_addr: &str,
+    database_dir_str: &str,
+    key_file_str: &str,
+    node_id_str: Option<&str>,
+    min_tree_height: Option<usize>,
+    max_block_size: Option<usize>,
+    mem_limit_power: Option<usize>,
+    merge_pile_threads: Option<usize>,
+    windows_count: Option<usize>,
+    rotate_count: Option<usize>,
+    signature_length: Option<usize>,
+    shingle_length: Option<usize>,
+    similarity_threshold: Option<f64>,
+    band_min_probability: Option<f64>,
+    stop_words: Vec<String>,
+    mmap_mode: mmap::MmapType,
+    data_access: DataAccess,
+)
+    -> Result<App, Error>
 {
     let zmq_ctx = zmq::Context::new();
     let ext_sock = zmq_ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e)))?;
@@ -252,24 +267,27 @@ pub fn entrypoint(external_zmq_addr: &str,
     let key_file = key_file_str.to_string();
     let node_id = node_id_str.map(|s| s.to_string());
     let slave_thread = Builder::new().name("slave thread".to_owned()).spawn(move || {
-        slave_loop(database_dir,
-                   int_sock_slave,
-                   slave_tx,
-                   slave_rx,
-                   key_file,
-                   node_id,
-                   min_tree_height,
-                   max_block_size,
-                   mem_limit_power,
-                   merge_pile_threads,
-                   windows_count,
-                   rotate_count,
-                   signature_length,
-                   shingle_length,
-                   similarity_threshold,
-                   band_min_probability,
-                   stop_words,
-                   mmap_mode).unwrap();
+        slave_loop(
+            database_dir,
+            int_sock_slave,
+            slave_tx,
+            slave_rx,
+            key_file,
+            node_id,
+            min_tree_height,
+            max_block_size,
+            mem_limit_power,
+            merge_pile_threads,
+            windows_count,
+            rotate_count,
+            signature_length,
+            shingle_length,
+            similarity_threshold,
+            band_min_probability,
+            stop_words,
+            mmap_mode,
+            data_access,
+        ).unwrap();
         slave_watchdog_tx.send(()).unwrap();
     }).unwrap();
 
@@ -556,24 +574,28 @@ impl Processor {
     }
 }
 
-fn slave_loop(database_dir: String,
-              mut int_sock: zmq::Socket,
-              tx: Sender<Message<Rep<Arc<String>>>>,
-              rx: Receiver<Message<Req<Arc<String>>>>,
-              key_file: String,
-              node_id: Option<String>,
-              min_tree_height: Option<usize>,
-              max_block_size: Option<usize>,
-              mem_limit_power: Option<usize>,
-              merge_pile_threads: Option<usize>,
-              windows_count: Option<usize>,
-              rotate_count: Option<usize>,
-              signature_length: Option<usize>,
-              shingle_length: Option<usize>,
-              similarity_threshold: Option<f64>,
-              band_min_probability: Option<f64>,
-              stop_words: Vec<String>,
-              mmap_mode: mmap::MmapType) -> Result<(), Error>
+fn slave_loop(
+    database_dir: String,
+    mut int_sock: zmq::Socket,
+    tx: Sender<Message<Rep<Arc<String>>>>,
+    rx: Receiver<Message<Req<Arc<String>>>>,
+    key_file: String,
+    node_id: Option<String>,
+    min_tree_height: Option<usize>,
+    max_block_size: Option<usize>,
+    mem_limit_power: Option<usize>,
+    merge_pile_threads: Option<usize>,
+    windows_count: Option<usize>,
+    rotate_count: Option<usize>,
+    signature_length: Option<usize>,
+    shingle_length: Option<usize>,
+    similarity_threshold: Option<f64>,
+    band_min_probability: Option<f64>,
+    stop_words: Vec<String>,
+    mmap_mode: mmap::MmapType,
+    data_access: DataAccess,
+)
+    -> Result<(), Error>
 {
     let mut config: Config = Default::default();
     signature_length.map(|v| config.signature_length = v);
@@ -586,6 +608,7 @@ fn slave_loop(database_dir: String,
     max_block_size.map(|v| params.compile_params.max_block_size = v);
     mem_limit_power.map(|v| params.compile_params.memory_limit_power = v);
     params.lookup_params.mmap_type = mmap_mode;
+    params.lookup_params.data_access = data_access;
     merge_pile_threads.map(|v| if v == 1 {
         params.compile_params.parallel_config = ParallelConfig::SingleThread
     } else if v > 1 {
@@ -710,60 +733,68 @@ fn main() {
              .help("Mmap type for RO windows.")
              .takes_value(true)
              .default_value("mmap"))
-        .arg(Arg::with_name("madvise-willneed")
+        .arg(Arg::with_name("data-access")
              .display_order(12)
+             .long("data-access")
+             .value_name("ACCESS")
+             .possible_values(&["file-seek", "memory-cache"])
+             .help("Data access for RO windows.")
+             .takes_value(true)
+             .default_value("file-seek"))
+        .arg(Arg::with_name("madvise-willneed")
+             .display_order(13)
              .long("madvise-willneed")
              .help("Set WILLNEED madvise(2) flag for mmap area."))
         .arg(Arg::with_name("signature-length")
-             .display_order(13)
+             .display_order(14)
              .long("signature-length")
              .value_name("LENGTH")
              .help("Signature length hd param to use.")
              .takes_value(true))
         .arg(Arg::with_name("shingle-length")
-             .display_order(14)
+             .display_order(15)
              .long("shingle-length")
              .value_name("LENGTH")
              .help("Shingle length hd param to use.")
              .takes_value(true))
         .arg(Arg::with_name("similarity-threshold")
-             .display_order(15)
+             .display_order(16)
              .long("similarity-threshold")
              .value_name("VALUE")
              .help("Similarity threshold hd param to use.")
              .takes_value(true))
         .arg(Arg::with_name("band-min-probability")
-             .display_order(16)
+             .display_order(17)
              .long("band-min-probability")
              .value_name("VALUE")
              .help("Band minimum probability hd param to use.")
              .takes_value(true))
         .arg(Arg::with_name("stop-dict")
-             .display_order(17)
+             .display_order(18)
              .short("s")
              .long("stop-dict")
              .value_name("FILE")
              .help("Stop words file (replaces default if provided).")
              .takes_value(true))
         .arg(Arg::with_name("daemonize")
-             .display_order(18)
+             .display_order(19)
              .long("daemonize")
              .help("Daemonize server."))
         .arg(Arg::with_name("redirect-stderr")
-             .display_order(19)
+             .display_order(20)
              .long("redirect-stderr")
              .value_name("FILE")
              .help("Redirect stderr to given file when daemonize.")
              .takes_value(true)
              .default_value("/dev/null"))
         .arg(Arg::with_name("pid-file")
-             .display_order(20)
+             .display_order(21)
              .long("pid-file")
              .value_name("FILE")
              .help("Save pid of the process into this file.")
              .takes_value(true))
         .arg(Arg::with_name("sd")
-             .display_order(21)
+             .display_order(22)
              .multiple(true)
              .long("sd")
              .value_name("WORD")
@@ -794,6 +825,7 @@ mod test {
     use zmq;
     use rand::{thread_rng, Rng};
     use bin_merge_pile::ntree_bkd::mmap;
+    use hash_dupl::backend::pile_lookup::DataAccess;
     use dupl_server_proto::{Trans, Req, Rep, Workload, LookupTask, LookupType, PostAction};
     use dupl_server_proto::{InsertCond, ClusterAssign, ClusterChoice, AssignCond, LookupResult, Match};
     use dupl_server_proto::bin::{ToBin, FromBin};
@@ -826,12 +858,15 @@ mod test {
     fn start_stop() {
         ensure_tmp_node_id();
         let _ = fs::remove_dir_all("/tmp/windows_dupl_server_a");
-        let mut app = entrypoint("ipc:///tmp/dupl_server_a",
-                                 "/tmp/windows_dupl_server_a",
-                                 "/tmp/dupl_server_a.key",
-                                 Some("/tmp/node.id"),
-                                 None, None, None, None, None, None, None, None, None, None, default_stop_dict(), mmap::MmapType::Malloc)
-            .unwrap();
+        let mut app = entrypoint(
+            "ipc:///tmp/dupl_server_a",
+            "/tmp/windows_dupl_server_a",
+            "/tmp/dupl_server_a.key",
+            Some("/tmp/node.id"),
+            None, None, None, None, None, None, None, None, None, None, default_stop_dict(),
+            mmap::MmapType::Malloc,
+            DataAccess::FileSeek,
+        ).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_a").unwrap();
         tx_sock(Trans::Sync(Req::Init), &mut sock);
@@ -845,12 +880,15 @@ mod test {
     fn insert_lookup() {
         ensure_tmp_node_id();
         let _ = fs::remove_dir_all("/tmp/windows_dupl_server_b");
-        let mut app = entrypoint("ipc:///tmp/dupl_server_b",
-                                 "/tmp/windows_dupl_server_b",
-                                 "/tmp/dupl_server_b.key",
-                                 Some("/tmp/node.id"),
-                                 None, None, None, None, None, None, None, None, None, None, default_stop_dict(), mmap::MmapType::Malloc)
-            .unwrap();
+        let mut app = entrypoint(
+            "ipc:///tmp/dupl_server_b",
+            "/tmp/windows_dupl_server_b",
+            "/tmp/dupl_server_b.key",
+            Some("/tmp/node.id"),
+            None, None, None, None, None, None, None, None, None, None, default_stop_dict(),
+            mmap::MmapType::Malloc,
+            DataAccess::FileSeek,
+        ).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_b").unwrap();
         // initially empty: expect EmptySet
@@ -979,12 +1017,15 @@ mod test {
         {
             ensure_tmp_node_id();
             let _ = fs::remove_dir_all("/tmp/windows_dupl_server_c");
-            let mut app = entrypoint("ipc:///tmp/dupl_server_c",
-                                     "/tmp/windows_dupl_server_c",
-                                     "/tmp/dupl_server_c.key",
-                                     Some("/tmp/node.id"),
-                                     None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict(), mmap::MmapType::Malloc)
-                .unwrap();
+            let mut app = entrypoint(
+                "ipc:///tmp/dupl_server_c",
+                "/tmp/windows_dupl_server_c",
+                "/tmp/dupl_server_c.key",
+                Some("/tmp/node.id"),
+                None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict(),
+                mmap::MmapType::Malloc,
+                DataAccess::FileSeek,
+            ).unwrap();
             let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_c").unwrap();
 
@@ -1018,12 +1059,15 @@ mod test {
             app.join();
         }
         {
-            let mut app = entrypoint("ipc:///tmp/dupl_server_c",
-                                     "/tmp/windows_dupl_server_c",
-                                     "/tmp/dupl_server_c.key",
-                                     Some("/tmp/node.id"),
-                                     None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict(), mmap::MmapType::Malloc)
-                .unwrap();
+            let mut app = entrypoint(
+                "ipc:///tmp/dupl_server_c",
+                "/tmp/windows_dupl_server_c",
+                "/tmp/dupl_server_c.key",
+                Some("/tmp/node.id"),
+                None, None, None, None, Some(8), Some(10), None, None, None, None, default_stop_dict(),
+                mmap::MmapType::Malloc,
+                DataAccess::FileSeek,
+            ).unwrap();
             let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
             sock.connect("ipc:///tmp/dupl_server_c").unwrap();
 
@@ -1059,12 +1103,15 @@ mod test {
         let mut custom_stop_dict = default_stop_dict();
         custom_stop_dict.push("javascript".to_owned());
         custom_stop_dict.push("php".to_owned());
-        let mut app = entrypoint("ipc:///tmp/dupl_server_d",
-                                 "/tmp/windows_dupl_server_d",
-                                 "/tmp/dupl_server_d.key",
-                                 Some("/tmp/node.id"),
-                                 None, None, None, None, None, None, None, None, None, None, custom_stop_dict, mmap::MmapType::Malloc)
-            .unwrap();
+        let mut app = entrypoint(
+            "ipc:///tmp/dupl_server_d",
+            "/tmp/windows_dupl_server_d",
+            "/tmp/dupl_server_d.key",
+            Some("/tmp/node.id"),
+            None, None, None, None, None, None, None, None, None, None, custom_stop_dict,
+            mmap::MmapType::Malloc,
+            DataAccess::FileSeek
+        ).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_d").unwrap();
 
@@ -1134,12 +1181,15 @@ mod test {
     fn insert_cluster_best_sim() {
         ensure_tmp_node_id();
         let _ = fs::remove_dir_all("/tmp/windows_dupl_server_e");
-        let mut app = entrypoint("ipc:///tmp/dupl_server_e",
-                                 "/tmp/windows_dupl_server_e",
-                                 "/tmp/dupl_server_e.key",
-                                 Some("/tmp/node.id"),
-                                 None, None, None, None, None, None, None, None, None, None, default_stop_dict(), mmap::MmapType::Malloc)
-            .unwrap();
+        let mut app = entrypoint(
+            "ipc:///tmp/dupl_server_e",
+            "/tmp/windows_dupl_server_e",
+            "/tmp/dupl_server_e.key",
+            Some("/tmp/node.id"),
+            None, None, None, None, None, None, None, None, None, None, default_stop_dict(),
+            mmap::MmapType::Malloc,
+            DataAccess::FileSeek
+        ).unwrap();
         let mut sock = app._zmq_ctx.socket(zmq::REQ).unwrap();
         sock.connect("ipc:///tmp/dupl_server_e").unwrap();
         // try to add something
